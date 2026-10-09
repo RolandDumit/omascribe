@@ -46,3 +46,10 @@ binaries, credentials or harness evidence to either source repository.
 Only report release completion after both GitHub and AUR are published and
 verified. If AUR credentials or access are missing, preserve the prepared files,
 report the exact missing step and continue all independent authorized work.
+
+AUR publication is currently deferred: on 2026-10-09 the maintainer reported
+that new account registrations are closed and confirmed they have no AUR account.
+Until access is available, continue GitHub releases and prepare/verify their AUR
+recipes, explicitly recording publication as pending. Do not repeatedly request
+unavailable credentials or block GitHub releases on this known prerequisite.
+Resume AUR publication when the maintainer confirms account and SSH access.

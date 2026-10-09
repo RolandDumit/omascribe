@@ -50,6 +50,19 @@ an empty `source` array. Keep it for local development. For every GitHub release
 publish a matching standalone AUR recipe; the local recipe must not be submitted
 unchanged to AUR.
 
+### Current AUR status
+
+On 2026-10-09 the maintainer reported that AUR has closed new account
+registrations. They do not yet have an AUR account, so publication is deferred.
+The verified 0.7.0 recipe is included in the GitHub release as
+`omascribe-0.7.0-1-aur.zip`, alongside the installable Arch package and checksums.
+Use the development checkout or the GitHub package while AUR access is unavailable.
+These installations need manual updates until the package is published on AUR.
+
+Continue preparing and verifying the AUR recipe for each GitHub release and
+record the unpublished step. When the maintainer confirms account and SSH access,
+publish the latest verified recipe. The existing GitHub tags remain unchanged.
+
 ## Mandatory release workflow
 
 A release is complete only when both GitHub and AUR contain the new version.
