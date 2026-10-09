@@ -1,79 +1,103 @@
-#include <QFont>
-#include <QFontDatabase>
 #include <QApplication>
+#include <QCoreApplication>
+#include <QDir>
 #include <QIcon>
 #include <QQmlApplicationEngine>
 #include <QQmlContext>
 #include <QQmlError>
-#include <QQuickStyle>
-#include <QUrl>
-#include <QWindow>
-#include <QFile>
+#include <QQuickWindow>
+#include <cstdio>
+#include <memory>
 
 #include "backend.h"
+#include "appversion.h"
+#include "controltransport.h"
+#include "editorsession.h"
+#include "runtimeprofile.h"
 #include "systemtheme.h"
 
 int main(int argc, char *argv[]) {
+    QStringList arguments;
+    for (int i = 1; i < argc; ++i) arguments << QString::fromLocal8Bit(argv[i]);
+    QString profile;
+    const int profileIndex = arguments.indexOf(QStringLiteral("--profile"));
+    if (profileIndex >= 0) {
+        if (profileIndex + 1 >= arguments.size()) {
+            std::fprintf(stderr, "--profile needs a directory.\n");
+            return 1;
+        }
+        profile = arguments.takeAt(profileIndex + 1);
+        arguments.removeAt(profileIndex);
+        QString error;
+        if (!RuntimeProfile::configure(profile, &error, !arguments.contains(QStringLiteral("--control")))) {
+            std::fprintf(stderr, "%s\n", error.toLocal8Bit().constData());
+            return 1;
+        }
+    }
+    if (arguments.contains(QStringLiteral("--control"))) {
+        QCoreApplication app(argc, argv);
+        app.setApplicationName(QStringLiteral("omascribe"));
+        app.setApplicationVersion(QString::fromLatin1(Omascribe::version));
+        return runControlClient(arguments);
+    }
+    if (arguments.contains(QStringLiteral("--help")) || arguments.contains(QStringLiteral("-h"))) {
+        std::puts("Usage: omascribe [--profile DIRECTORY] [FILE]\n"
+                  "       omascribe [--profile DIRECTORY] --control list\n"
+                  "       omascribe [--profile DIRECTORY] --control --session UUID < request.json");
+        return 0;
+    }
+    if (arguments == QStringList{QStringLiteral("--version")}) {
+        std::printf("Omascribe %s\n", Omascribe::version);
+        return 0;
+    }
+    if (arguments.size() > 1 || (!arguments.isEmpty() && arguments.first().startsWith(QLatin1Char('-')))) {
+        std::fprintf(stderr, "Use --help for supported arguments.\n");
+        return 1;
+    }
+    if (!profile.isEmpty()) QCoreApplication::setAttribute(Qt::AA_DontUseNativeDialogs);
     QApplication app(argc, argv);
-    app.setApplicationName(QStringLiteral("omawrite"));
-    app.setDesktopFileName(QStringLiteral("omawrite"));
-    app.setWindowIcon(QIcon::fromTheme(QStringLiteral("omawrite")));
-
-    QFontDatabase::addApplicationFont(QStringLiteral(":/fonts/IBMPlexMono-Regular.ttf"));
-    QFontDatabase::addApplicationFont(QStringLiteral(":/fonts/IBMPlexMono-Italic.ttf"));
-    QFontDatabase::addApplicationFont(QStringLiteral(":/fonts/IBMPlexMono-Bold.ttf"));
-    QFontDatabase::addApplicationFont(QStringLiteral(":/fonts/IBMPlexMono-BoldItalic.ttf"));
-    app.setOrganizationName(QStringLiteral("Omacom"));
-    app.setOrganizationDomain(QStringLiteral("omacom.io"));
-
-    QQuickStyle::setStyle(QStringLiteral("Material"));
+    RuntimeProfile::initializeApplication(app);
+    app.setWindowIcon(QIcon::fromTheme(QStringLiteral("omascribe")));
 
     Backend backend(&app);
-    SystemTheme systemTheme(&app);
-    backend.setDarkMode(systemTheme.darkMode());
-    QObject::connect(&systemTheme, &SystemTheme::darkModeChanged, &backend,
-                     &Backend::setDarkMode);
-
-    // Carry the desktop's text scale into the default font, so the chrome that
-    // inherits it (dialog titles, buttons) grows along with the writing area.
-    const QFont interfaceFont(QStringLiteral("IBM Plex Mono"));
-    const qreal basePointSize = interfaceFont.pointSizeF() > 0
-        ? interfaceFont.pointSizeF()
-        : app.font().pointSizeF();
-    const auto applyInterfaceFont = [&app, interfaceFont, basePointSize](qreal textScale) {
-        QFont scaled = interfaceFont;
-        scaled.setPointSizeF(basePointSize * textScale);
-        app.setFont(scaled);
-    };
-    applyInterfaceFont(systemTheme.textScale());
-
-    backend.setTextScale(systemTheme.textScale());
-    QObject::connect(&systemTheme, &SystemTheme::textScaleChanged, &backend,
-                     [&backend, applyInterfaceFont](qreal textScale) {
-        applyInterfaceFont(textScale);
-        backend.setTextScale(textScale);
+    QObject::connect(&backend, &Backend::textScaleChanged, &app, [&app, &backend] {
+        RuntimeProfile::applyTextScale(app, backend.textScale());
     });
+    EditorSession session(&backend, &app);
+    std::unique_ptr<SystemTheme> systemTheme;
+    if (profile.isEmpty()) {
+        systemTheme = std::make_unique<SystemTheme>(&app);
+        backend.setDarkMode(systemTheme->darkMode());
+        backend.setTextScale(systemTheme->textScale());
+        RuntimeProfile::applyTextScale(app, systemTheme->textScale());
+        QObject::connect(systemTheme.get(), &SystemTheme::darkModeChanged, &backend, &Backend::setDarkMode);
+        QObject::connect(systemTheme.get(), &SystemTheme::textScaleChanged, &backend, [&app, &backend](qreal scale) {
+            RuntimeProfile::applyTextScale(app, scale);
+            backend.setTextScale(scale);
+        });
+    } else backend.setTextScale(RuntimeProfile::textScale());
 
     QQmlApplicationEngine engine;
-    QObject::connect(&engine, &QQmlApplicationEngine::warnings, &app,
-                     [](const QList<QQmlError> &warnings) {
-        for (const QQmlError &warning : warnings)
-            qWarning().noquote() << warning.toString();
+    QObject::connect(&engine, &QQmlApplicationEngine::warnings, &app, [](const QList<QQmlError> &warnings) {
+        for (const QQmlError &warning : warnings) qWarning().noquote() << warning.toString();
     });
     engine.rootContext()->setContextProperty(QStringLiteral("backend"), &backend);
-
+    engine.rootContext()->setContextProperty(QStringLiteral("session"), &session);
     engine.load(QUrl(QStringLiteral("qrc:/Main.qml")));
     if (engine.rootObjects().isEmpty()) {
-        qCritical() << "Could not load the Omawrite interface; resource available:"
-                    << QFile::exists(QStringLiteral(":/Main.qml"));
-        return -1;
+        qCritical() << "Could not load the Omascribe interface.";
+        return 1;
     }
-
-    backend.setParentWindow(qobject_cast<QWindow *>(engine.rootObjects().constFirst()));
-
-    const QStringList args = app.arguments();
-    if (args.size() > 1 && !backend.modified())
-        backend.open(QUrl::fromLocalFile(args.at(1)));
-
+    auto *window = qobject_cast<QQuickWindow *>(engine.rootObjects().constFirst());
+    backend.setParentWindow(window);
+    session.attachWindow(window);
+    if (!arguments.isEmpty() && !backend.modified()) {
+        const QString file = QDir::isAbsolutePath(arguments.first()) ? arguments.first()
+            : QDir::currentPath() + QLatin1Char('/') + arguments.first();
+        session.requestOpen(QUrl::fromLocalFile(file));
+    }
+    ControlServer control(&session, &app);
+    QString error;
+    if (!control.listen(&error)) qWarning().noquote() << "Local control unavailable:" << error;
     return app.exec();
 }

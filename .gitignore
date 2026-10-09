@@ -1,5 +1,6 @@
 /build/
 /build-tests/
+/.harness/
 /pkg/
 /pkgbuild/pkg/
 /pkgbuild/src/

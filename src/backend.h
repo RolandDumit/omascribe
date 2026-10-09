@@ -15,6 +15,7 @@ class MarkdownHighlighter;
 class QTextDocument;
 class QWindow;
 class QLockFile;
+class EditorSession;
 
 class Backend : public QObject {
     Q_OBJECT
@@ -63,7 +64,7 @@ public:
 
     Q_INVOKABLE void attachDocument(QObject *textDocument);
     Q_INVOKABLE void openDialog();
-    Q_INVOKABLE void open(const QUrl &url);
+    Q_INVOKABLE bool open(const QUrl &url);
     Q_INVOKABLE void save();
     Q_INVOKABLE void saveForClose();
     Q_INVOKABLE void saveAsDialog();
@@ -98,13 +99,16 @@ signals:
     void saveDialogRequested(const QUrl &suggestedUrl);
     void saveSucceeded();
     void externalChangeDetected(bool deleted, bool locallyModified);
+    void documentLoaded();
+    void documentTextChanged();
 
 private:
+    friend class EditorSession;
     void loadDocumentText(const QString &text);
     void setFileUrl(const QUrl &url);
     void setModified(bool modified);
     void setStatus(const QString &status);
-    void saveTo(const QUrl &url);
+    bool saveTo(const QUrl &url, const QString &writePath = {});
     QUrl suggestedSaveUrl() const;
     QString currentDocumentText() const;
     void setWordCount(int words);

@@ -1,12 +1,12 @@
 [Desktop Entry]
 Type=Application
-Name=Omawrite
+Name=Omascribe
 GenericName=Markdown Writer
-Comment=Dead-simple Markdown writing app
-Exec=omawrite %f
-Icon=omawrite
+Comment=Markdown editor for Omarchy
+Exec=omascribe %f
+Icon=omascribe
 Terminal=false
-Categories=Office;WordProcessor;TextEditor;
+Categories=Office;WordProcessor;
 MimeType=text/markdown;text/x-markdown;text/plain;
 Keywords=markdown;write;notes;text;editor;
-StartupWMClass=omawrite
+StartupWMClass=omascribe

@@ -13,7 +13,7 @@ ApplicationWindow {
     minimumWidth: 720
     minimumHeight: 520
     visible: true
-    title: (backend.modified ? "* " : "") + backend.fileName + " - Omawrite"
+    title: (backend.modified ? "* " : "") + backend.fileName + " - Omascribe"
 
     readonly property bool darkMode: backend.darkMode
     readonly property color pageColor: backend.themeBackground
@@ -35,44 +35,21 @@ ApplicationWindow {
     property bool searchUpdating: false
     property var searchMatches: []
     property int searchMatchIndex: -1
-    property url pendingOpenUrl
-    property string pendingAction: ""
+    readonly property string pendingAction: session.pendingAction
     property bool replaceOpen: false
-    property bool awaitingPendingSave: false
 
     Material.theme: darkMode ? Material.Dark : Material.Light
     Material.accent: backend.themeAccent
     color: pageColor
 
     onClosing: function(close) {
-        if (closeConfirmed || !backend.modified)
+        if (closeConfirmed)
             return;
-
-        close.accepted = false;
-        pendingAction = "close";
-        if (!unsavedChangesDialog.opened)
-            unsavedChangesDialog.open();
+        close.accepted = session.requestClose();
     }
 
     function requestOpen(url) {
-        if (!backend.modified) {
-            backend.open(url);
-            return;
-        }
-        pendingOpenUrl = url;
-        pendingAction = "open";
-        unsavedChangesDialog.open();
-    }
-
-    function completePendingAction() {
-        var action = pendingAction;
-        pendingAction = "";
-        if (action === "close") {
-            closeConfirmed = true;
-            close();
-        } else if (action === "open") {
-            backend.open(pendingOpenUrl);
-        }
+        session.requestOpen(url);
     }
 
     FontMetrics {
@@ -141,7 +118,7 @@ ApplicationWindow {
     Shortcut {
         sequence: "Ctrl+S"
         context: Qt.ApplicationShortcut
-        onActivated: backend.save()
+        onActivated: session.requestSave()
     }
 
     Shortcut {
@@ -194,13 +171,13 @@ ApplicationWindow {
     Shortcut {
         sequence: "Ctrl+Shift+S"
         context: Qt.ApplicationShortcut
-        onActivated: backend.saveAsDialog()
+        onActivated: session.requestSaveAs()
     }
 
     Shortcut {
         sequence: "Ctrl+P"
         context: Qt.ApplicationShortcut
-        onActivated: backend.printDocument()
+        onActivated: session.printDocument()
     }
 
     Shortcut {
@@ -250,17 +227,6 @@ ApplicationWindow {
             saveFileDialog.open();
         }
 
-        function onCloseAfterSave() {
-            win.closeConfirmed = true;
-            win.close();
-        }
-
-        function onSaveSucceeded() {
-            win.awaitingPendingSave = false;
-            if (win.pendingAction !== "")
-                win.completePendingAction();
-        }
-
         function onExternalChangeDetected(deleted, locallyModified) {
             externalChangeDialog.deleted = deleted;
             externalChangeDialog.locallyModified = locallyModified;
@@ -268,29 +234,46 @@ ApplicationWindow {
         }
     }
 
+    Connections {
+        target: session
+        function onUnsavedDecisionRequested() { unsavedChangesDialog.open(); }
+        function onCloseRequested() {
+            win.closeConfirmed = true;
+            win.close();
+        }
+        function onExternalResolved() { externalChangeDialog.close(); }
+    }
+
     Dialogs.FileDialog {
         id: openFileDialog
+        objectName: "openFileDialog"
         title: "Open File"
         fileMode: Dialogs.FileDialog.OpenFile
         nameFilters: ["Markdown files (*.md *.markdown)", "All files (*)"]
         onAccepted: win.requestOpen(selectedFile)
+        onVisibleChanged: session.setDialog("open", visible)
     }
 
     Dialogs.FileDialog {
         id: saveFileDialog
+        objectName: "saveFileDialog"
         title: "Save File"
         fileMode: Dialogs.FileDialog.SaveFile
         nameFilters: ["Markdown files (*.md *.markdown)", "All files (*)"]
-        onAccepted: backend.saveAs(selectedFile)
+        onAccepted: session.acceptSave(selectedFile)
+        onVisibleChanged: session.setDialog("save", visible)
         onRejected: {
             backend.fileDialogCanceled();
-            win.awaitingPendingSave = false;
-            win.pendingAction = "";
+            session.cancelPending();
         }
     }
 
     UnsavedChangesDialog {
         id: unsavedChangesDialog
+        objectName: "unsavedChangesDialog"
+        onVisibleChanged: session.setDialog("unsaved", visible)
+        onOpened: session.setDialog("unsaved", true)
+        onClosed: session.setDialog("unsaved", false)
         fileName: backend.fileName
         darkMode: win.darkMode
         textScale: win.textScale
@@ -300,20 +283,17 @@ ApplicationWindow {
         containerWidth: win.width
         containerHeight: win.height
 
-        onDiscardRequested: {
-            backend.discardRecovery();
-            win.completePendingAction();
-        }
-
-        onSaveRequested: {
-            win.awaitingPendingSave = true;
-            backend.save();
-        }
-        onCancelRequested: win.pendingAction = ""
+        onDiscardRequested: session.resolvePending("discard")
+        onSaveRequested: session.resolvePending("save")
+        onCancelRequested: session.resolvePending("cancel")
     }
 
     ExternalChangeDialog {
         id: externalChangeDialog
+        objectName: "externalChangeDialog"
+        onVisibleChanged: session.setDialog("external", visible)
+        onOpened: session.setDialog("external", true)
+        onClosed: session.setDialog("external", false)
         darkMode: win.darkMode
         textScale: win.textScale
         textColor: win.textColor
@@ -321,19 +301,22 @@ ApplicationWindow {
         containerWidth: win.width
         containerHeight: win.height
 
-        onKeepRequested: backend.keepExternalVersion()
-        onReloadRequested: backend.reloadFromDisk()
+        onKeepRequested: session.resolveExternal("keep")
+        onReloadRequested: session.resolveExternal("reload")
     }
 
     Dialog {
         id: shortcutsDialog
+        objectName: "shortcutsDialog"
         modal: true
         title: "Keyboard shortcuts"
         standardButtons: Dialog.Close
         anchors.centerIn: parent
+        width: Math.min(win.width - 48, 600)
         contentItem: Label {
             text: "Ctrl+S  Save\nCtrl+Shift+S  Save As\nCtrl+O  Open\nCtrl+N  New Window\nCtrl+F  Find\nCtrl+H  Find and Replace\nCtrl+B  Bold\nCtrl+I  Italic\nCtrl+K  Link\nCtrl+P  Print\nF11 / Super+F  Fullscreen\nCtrl+?  Shortcuts"
             lineHeight: 1.5
+            wrapMode: Text.Wrap
         }
     }
 
@@ -813,7 +796,7 @@ ApplicationWindow {
                 iconName: "save"
                 iconColor: win.mutedColor
                 tooltip: "Save"
-                onClicked: backend.save()
+                onClicked: session.requestSave()
             }
 
             FooterIconButton {
@@ -909,6 +892,7 @@ ApplicationWindow {
 
                     TextInput {
                         id: searchField
+                        objectName: "searchField"
                         anchors.left: parent.left
                         anchors.right: parent.right
                         anchors.top: parent.top
@@ -933,6 +917,7 @@ ApplicationWindow {
 
                     TextInput {
                         id: replaceField
+                        objectName: "replaceField"
                         anchors.left: parent.left
                         anchors.right: parent.right
                         anchors.bottom: parent.bottom
@@ -977,6 +962,7 @@ ApplicationWindow {
 
                 Button {
                     id: replaceCurrentButton
+                    objectName: "replaceCurrentButton"
                     visible: win.replaceOpen
                     text: "Replace"
                     onClicked: {
@@ -990,6 +976,7 @@ ApplicationWindow {
                 }
 
                 Button {
+                    objectName: "replaceAllButton"
                     visible: win.replaceOpen
                     text: "All"
                     onClicked: {

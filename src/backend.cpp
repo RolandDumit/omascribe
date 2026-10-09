@@ -11,6 +11,7 @@
 #include <QGuiApplication>
 #include <QMimeData>
 #include <QProcess>
+#include <QProcessEnvironment>
 #include <QPrintDialog>
 #include <QPrinter>
 #include <QQuickTextDocument>
@@ -33,6 +34,7 @@
 #include <algorithm>
 
 #include "markdownhighlighter.h"
+#include "runtimeprofile.h"
 
 constexpr qreal typoraLineHeightPercent = 140;
 const QString lastSaveDirectorySetting = QStringLiteral("file/lastSaveDirectory");
@@ -97,7 +99,7 @@ Backend::Backend(QObject *parent) : QObject(parent) {
         ? savedFont
         : defaultEditorFont();
 
-    const QString stateDirectory = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
+    const QString stateDirectory = RuntimeProfile::dataDirectory();
     QDir().mkpath(stateDirectory);
     // Claim an orphaned snapshot before taking an empty slot. This ensures a
     // crash in window 2 is still recovered even if window 1 exited normally.
@@ -223,17 +225,17 @@ void Backend::openDialog() {
     emit openDialogRequested();
 }
 
-void Backend::open(const QUrl &url) {
+bool Backend::open(const QUrl &url) {
     if (!url.isLocalFile()) {
         setStatus(QStringLiteral("Only local files can be opened."));
-        return;
+        return false;
     }
 
     const QString targetName = QFileInfo(url.toLocalFile()).fileName();
     QFile file(url.toLocalFile());
-    if (!file.open(QIODevice::ReadOnly | QIODevice::Text)) {
+    if (!file.open(QIODevice::ReadOnly)) {
         setStatus(QStringLiteral("Could not open %1.").arg(targetName));
-        return;
+        return false;
     }
 
     const QByteArray contents = file.readAll();
@@ -245,6 +247,7 @@ void Backend::open(const QUrl &url) {
     watchCurrentFile();
     setModified(false);
     setStatus(QStringLiteral("Opened %1").arg(fileName()));
+    return true;
 }
 
 void Backend::save() {
@@ -324,8 +327,21 @@ void Backend::printDocument() {
 }
 
 void Backend::newWindow() {
-    const bool started = QProcess::startDetached(QCoreApplication::applicationFilePath(),
-                                                 QStringList());
+    QStringList arguments;
+    if (!RuntimeProfile::path().isEmpty())
+        arguments << QStringLiteral("--profile") << RuntimeProfile::path();
+    QProcess process;
+    process.setProgram(QCoreApplication::applicationFilePath());
+    process.setArguments(arguments);
+    QProcessEnvironment environment = QProcessEnvironment::systemEnvironment();
+    if (!RuntimeProfile::path().isEmpty()) {
+        // The profile's current palette belongs to all its windows. Starting a
+        // child must not reset it to the parent's original launch override.
+        environment.remove(QStringLiteral("OMASCRIBE_PROFILE_THEME"));
+        environment.insert(QStringLiteral("OMASCRIBE_PROFILE_SCALE"), QString::number(m_textScale));
+    }
+    process.setProcessEnvironment(environment);
+    const bool started = process.startDetached();
     if (!started)
         setStatus(QStringLiteral("Could not open a new window."));
 }
@@ -371,6 +387,8 @@ bool Backend::editorTextChanged() {
     if (text == m_lastDocumentText)
         return false;
     m_lastDocumentText = text;
+
+    emit documentTextChanged();
 
     if (m_document) {
         const int blockCount = m_document->blockCount();
@@ -514,6 +532,7 @@ void Backend::loadDocumentText(const QString &text) {
     applyDocumentTypography();
     m_wordCountTimer.stop();
     setWordCount(countWords(text));
+    emit documentLoaded();
 }
 
 void Backend::setFileUrl(const QUrl &url) {
@@ -541,19 +560,21 @@ void Backend::setStatus(const QString &status) {
     emit statusChanged();
 }
 
-void Backend::saveTo(const QUrl &url) {
+bool Backend::saveTo(const QUrl &url, const QString &writePath) {
     if (!url.isLocalFile()) {
         m_closeAfterSave = false;
         setStatus(QStringLiteral("Only local files can be saved."));
-        return;
+        return false;
     }
 
     const QString targetName = QFileInfo(url.toLocalFile()).fileName();
-    QSaveFile file(url.toLocalFile());
+    // The session resolves links before writing. QSaveFile's own lexical
+    // symlink normalization can change a relative target containing '..'.
+    QSaveFile file(writePath.isEmpty() ? url.toLocalFile() : writePath);
     if (!file.open(QIODevice::WriteOnly | QIODevice::Text)) {
         m_closeAfterSave = false;
         setStatus(QStringLiteral("Could not save %1.").arg(targetName));
-        return;
+        return false;
     }
 
     const QByteArray contents = currentDocumentText().toUtf8();
@@ -571,7 +592,7 @@ void Backend::saveTo(const QUrl &url) {
         watchCurrentFile();
         m_closeAfterSave = false;
         setStatus(QStringLiteral("Could not write %1.").arg(targetName));
-        return;
+        return false;
     }
 
     const bool shouldClose = m_closeAfterSave;
@@ -589,6 +610,7 @@ void Backend::saveTo(const QUrl &url) {
 
     if (shouldClose)
         emit closeAfterSave();
+    return true;
 }
 
 void Backend::scheduleRecovery() {
@@ -610,7 +632,9 @@ void Backend::writeRecovery() {
     if (!file.open(QIODevice::WriteOnly))
         return;
     const QJsonObject recovery{{QStringLiteral("fileUrl"), m_fileUrl.toString()},
-                               {QStringLiteral("text"), currentDocumentText()}};
+                               {QStringLiteral("text"), currentDocumentText()},
+                               {QStringLiteral("diskKnown"), m_hasKnownFileContents},
+                               {QStringLiteral("diskContents"), QString::fromLatin1(m_lastKnownFileContents.toBase64())}};
     file.write(QJsonDocument(recovery).toJson(QJsonDocument::Compact));
     file.commit();
 }
@@ -620,19 +644,19 @@ void Backend::restoreRecovery() {
     if (!file.open(QIODevice::ReadOnly))
         return;
     const QJsonDocument json = QJsonDocument::fromJson(file.readAll());
-    if (!json.isObject() || !json.object().contains(QStringLiteral("text")))
+    if (!json.isObject() || !json.object().value(QStringLiteral("text")).isString())
         return;
     const QJsonObject recovery = json.object();
     loadDocumentText(recovery.value(QStringLiteral("text")).toString());
     const QUrl recoveredUrl(recovery.value(QStringLiteral("fileUrl")).toString());
-    QFile diskFile(recoveredUrl.toLocalFile());
-    if (recoveredUrl.isLocalFile() && diskFile.open(QIODevice::ReadOnly)) {
-        m_lastKnownFileContents = diskFile.readAll();
-        m_hasKnownFileContents = true;
-    } else {
-        m_lastKnownFileContents.clear();
-        m_hasKnownFileContents = false;
-    }
+    // A crash must not acknowledge edits made on disk while the app was gone.
+    // Legacy snapshots without a baseline require an explicit keep/reload.
+    const QByteArray encoded = recovery.value(QStringLiteral("diskContents")).toString().toLatin1();
+    m_lastKnownFileContents = QByteArray::fromBase64(encoded);
+    m_hasKnownFileContents = recovery.value(QStringLiteral("diskKnown")).toBool()
+        && recovery.value(QStringLiteral("diskContents")).isString()
+        && m_lastKnownFileContents.toBase64() == encoded;
+    if (!m_hasKnownFileContents) m_lastKnownFileContents.clear();
     setFileUrl(recoveredUrl);
     setModified(true);
     setStatus(QStringLiteral("Recovered unsaved changes"));
@@ -657,8 +681,7 @@ void Backend::loadOmarchyTheme() {
     m_themeAccent = m_darkMode ? QStringLiteral("#5584aa") : QStringLiteral("#2077b2");
     m_themeSelection = m_darkMode ? QStringLiteral("#186a9a") : QStringLiteral("#2077b2");
 
-    const QString colorsPath = QDir::homePath()
-        + QStringLiteral("/.local/state/omarchy/current/theme/colors.toml");
+    const QString colorsPath = RuntimeProfile::themeDirectory() + QStringLiteral("/colors.toml");
     QString themeMode;
     QFile file(colorsPath);
     if (file.open(QIODevice::ReadOnly | QIODevice::Text)) {
@@ -727,9 +750,8 @@ void Backend::watchOmarchyTheme() {
     if (!watched.isEmpty())
         m_themeWatcher.removePaths(watched);
 
-    const QString currentDir = QDir::homePath()
-        + QStringLiteral("/.local/state/omarchy/current");
-    const QString themeDir = currentDir + QStringLiteral("/theme");
+    const QString themeDir = RuntimeProfile::themeDirectory();
+    const QString currentDir = QFileInfo(themeDir).absolutePath();
     const QString colorsPath = themeDir + QStringLiteral("/colors.toml");
 
     if (QDir(currentDir).exists())
@@ -746,7 +768,7 @@ QUrl Backend::suggestedSaveUrl() const {
 
     const QString savedDirectory = QSettings().value(lastSaveDirectorySetting).toString();
     const QDir directory = savedDirectory.isEmpty() || !QDir(savedDirectory).exists()
-        ? QDir::home()
+        ? (RuntimeProfile::path().isEmpty() ? QDir::home() : QDir(RuntimeProfile::path() + QStringLiteral("/documents")))
         : QDir(savedDirectory);
     return QUrl::fromLocalFile(
         directory.filePath(suggestedFileName(currentDocumentText())));

@@ -67,6 +67,7 @@ Dialog {
 
             SquareDialogButton {
                 id: cancelButton
+                objectName: "unsavedCancel"
                 text: "Cancel"
                 darkMode: root.darkMode
                 textScale: root.textScale
@@ -80,6 +81,7 @@ Dialog {
 
             SquareDialogButton {
                 id: discardButton
+                objectName: "unsavedDiscard"
                 text: "Discard"
                 darkMode: root.darkMode
                 textScale: root.textScale
@@ -96,6 +98,7 @@ Dialog {
 
             SquareDialogButton {
                 id: saveButton
+                objectName: "unsavedSave"
                 text: "Save"
                 primary: true
                 darkMode: root.darkMode
