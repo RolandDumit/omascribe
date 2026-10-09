@@ -49,10 +49,14 @@ opaque string; it belongs only to the current session.
 `state` includes `id`, `pid`, `version`, `file` (absolute path, empty for an
 unnamed draft), `modified`, `canUndo`, `canRedo`, `cursor`, `selectionStart`,
 `selectionEnd`, `externalChanged`, `externalDeleted`, `pendingAction`,
-`activeDialog`, `darkMode`, `textScale`, and `window` metadata including width,
+`activeDialog`, `darkMode`, `textScale`, `viewMode` (`source`, `split`, `preview`),
+`splitRatio` (preferred source-pane fraction), and `window` metadata including width,
 height, device pixel ratio and visibility. Text is included by default. Use
 `includeText: false` for metadata only. A document that would exceed the response
 limit produces `response_too_large` with metadata instead of truncated text.
+View metadata is informational; there are no new control commands. Switching
+views does not change the document version. Edits, selection, undo/redo and
+document transitions operate on the persistent source even in Preview.
 
 | Command | Arguments in `args` |
 | --- | --- |

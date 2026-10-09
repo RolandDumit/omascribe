@@ -1,5 +1,5 @@
 #pragma once
 
 namespace Omascribe {
-inline constexpr char version[] = "0.7.0";
+inline constexpr char version[] = "1.0.0";
 }

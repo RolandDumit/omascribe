@@ -127,6 +127,8 @@ QJsonObject EditorSession::state(bool includeText) {
         {QStringLiteral("wordCount"), Backend::countWords(m_backend->currentDocumentText())},
         {QStringLiteral("darkMode"), m_backend->darkMode()}, {QStringLiteral("textScale"), m_backend->textScale()}
     };
+    result.insert(QStringLiteral("viewMode"), m_backend->viewMode());
+    result.insert(QStringLiteral("splitRatio"), m_backend->splitRatio());
     if (includeText) result.insert(QStringLiteral("text"), m_backend->currentDocumentText());
     if (m_window) {
         result.insert(QStringLiteral("window"), QJsonObject{{QStringLiteral("width"), m_window->width()},

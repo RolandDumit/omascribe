@@ -24,6 +24,40 @@ dependency in the harness.
   style for both the application and QML tests. Isolated profiles choose a
   deterministic palette and text scale before Qt starts.
 
+## Document views
+
+Source, Split view and Preview share one persistent `sourceEditor` and its
+`QTextDocument`. The read-only preview has a separate Markdown document bound to
+the live source; it never attaches to Backend or participates in document
+transitions. Mode changes do not invalidate session versions or change recovery,
+modified state, selection or undo history. Control edits still target the source
+when it is hidden, and update the preview normally.
+
+Both panes use `DocumentViewport` for wheel scrolling. In Split view their
+scrollable extents are synchronized proportionally, with a reentrancy guard and
+deferred alignment after layout changes. This is not a mapping between source
+lines and rendered blocks. The draggable split respects minimum pane widths;
+resizing the window preserves the preferred ratio. `editor/viewMode` and
+`editor/splitRatio` use the existing profile-aware QSettings configuration,
+defaulting to source and 0.5 when missing or invalid.
+
+Preview shares the source font, theme and scale. Relative resources use the named
+file's directory; untitled resource lookup stays in the application's data
+directory. Find and Replace reveal the source in Split view. UI formatting and
+undo/redo shortcuts require source focus. Save, open and print still use
+EditorSession in every view.
+
+Preview formatting applies font-relative margins to its separate QTextDocument
+after Markdown parsing and font changes. Ordinary block gaps are 1 em, heading
+top margins 1.5 em, and adjacent list-item gaps 0.25 em. Code lines and table
+cells do not receive paragraph margins; tables use frame margins, with empty
+structural paragraphs collapsed. Markdown hard breaks remain inside their
+paragraph: a comparison parse with soft breaks identifies the QTextBlocks that
+Qt splits for those breaks. Content line height, source formatting, undo history
+and session versions are unaffected. Explicit
+margins avoid Qt's Markdown paragraph defaults relying on point-sized fonts
+while Omascribe uses pixel-sized fonts.
+
 ## Profiles and discovery
 
 Normal launches keep the existing desktop settings and theme behavior. A launch

@@ -2,8 +2,8 @@
 
 A Markdown writing app built with Qt Quick and C++ that automatically follows system dark/light mode.
 
-Omascribe is based on [Omawrite](https://github.com/omacom-io/omawrite) and continues
-its version sequence with **0.7.0**. This fork is maintained at
+Omascribe is based on [Omawrite](https://github.com/omacom-io/omawrite) and is now at
+**1.0.0**. This fork is maintained at
 [RolandDumit/omascribe](https://github.com/RolandDumit/omascribe).
 
 <img width="2948" height="3227" alt="screenshot-2026-06-23_15-24-08" src="https://github.com/user-attachments/assets/4e930c0d-edda-4046-b444-a59eff523329" />
@@ -18,7 +18,7 @@ Install the current checkout as an Arch package from a terminal:
 bin/install
 ```
 
-This builds and installs `omascribe` 0.7.0-1 through makepkg and pacman, including
+This builds and installs `omascribe` 1.0.0-1 through makepkg and pacman, including
 the application launcher and icon. Run `omascribe` afterwards. It can coexist
 with the official `omawrite` package: binaries, desktop entries, settings and
 recovery data use separate names. Existing Omawrite preferences and drafts are
@@ -30,6 +30,15 @@ automatically. Every GitHub release also requires updating the PKGBUILD and
 publishing its matching AUR recipe. See [packaging and release updates](docs/packaging.md)
 for the mandatory workflow and `bin/harness prepare-aur` helper. Omascribe is not distributed through the
 official Omarchy package repository.
+
+## Release 1.0.0
+
+Source, Split and Preview views now share a persistent document, with live Markdown
+rendering, a resizable divider, synchronized scrolling and remembered preferences.
+Preview uses font-relative spacing between Markdown blocks. See the
+[release notes](docs/releases/1.0.0.md) for details and verification. The GitHub
+release includes an Arch package and a standalone AUR recipe; AUR publication
+remains pending maintainer account and SSH access.
 
 ## Shortcuts
 
@@ -47,6 +56,23 @@ official Omarchy package repository.
 
 Unsaved drafts are recovered after an abnormal exit. Omascribe also watches open files
 and warns before an external change can replace local work.
+
+The centered footer selector switches between Source, Split view and Preview.
+Split view places the source on the left and a live, read-only Markdown preview
+on the right. Drag the divider to resize the panes; scrolling either pane keeps
+their relative positions synchronized. Omascribe remembers the view and split
+proportion. Changing views preserves the source, selection and undo history.
+Find and Replace from Preview open Split view. Formatting and undo/redo shortcuts
+apply when the source editor has focus; text in Preview can be selected and copied.
+
+Preview uses Qt's Markdown renderer, including tables and task lists, with the
+same writing font, text scale and theme as the source. Local relative images are
+resolved from the current file's directory, including after Save As. Untitled
+drafts have no file directory. Wide tables, code and images can be scrolled
+horizontally. Formula and diagram extensions are not included.
+Preview separates paragraphs, lists, code blocks and tables by one text-size
+unit, with extra space before headings. Wrapped lines and code lines stay
+compact, and list items use a smaller gap. These margins follow text scaling.
 
 The font button in the footer picks the writing font from any installed text font,
 and Omascribe remembers the choice. IBM Plex Mono is the default.

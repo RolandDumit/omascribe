@@ -26,10 +26,91 @@ ApplicationWindow {
     // the app at the sizes it was designed around.
     readonly property real textScale: backend.textScale
     readonly property int editorFontPixelSize: scaledSize(20)
-    readonly property int footerHeight: scaledSize(32)
-    readonly property int editorWidth: Math.min(
-        Math.round(writerFontMetrics.averageCharacterWidth * 65),
-        Math.max(360, width - Math.round(writerFontMetrics.averageCharacterWidth * 20)))
+    readonly property int footerHeight: scaledSize(40)
+    readonly property string viewMode: backend.viewMode
+    property bool synchronizingScroll: false
+    property bool cursorEnsurePending: false
+    property real scrollProgress: 0
+
+    function pageWidth(availableWidth) {
+        return Math.min(Math.round(writerFontMetrics.averageCharacterWidth * 65),
+                        Math.max(1, availableWidth - scaledSize(24)));
+    }
+
+    function trackScroll(viewport, userNavigation) {
+        if (synchronizingScroll || !viewport.visible
+                || (scrollSync.running && !userNavigation && !viewport.userScrolling))
+            return;
+        var extent = Math.max(0, viewport.contentHeight - viewport.height);
+        scrollProgress = extent > 0 ? Math.max(0, Math.min(1, viewport.contentY / extent)) : 0;
+        if (viewMode === "split")
+            alignScroll(viewport);
+    }
+
+    function alignScroll(leader) {
+        synchronizingScroll = true;
+        if (leader !== editorFlick && sourcePane.visible)
+            editorFlick.scrollTo(scrollProgress * Math.max(0, editorFlick.contentHeight - editorFlick.height));
+        if (leader !== previewFlick && previewPane.visible)
+            previewFlick.scrollTo(scrollProgress * Math.max(0, previewFlick.contentHeight - previewFlick.height));
+        synchronizingScroll = false;
+    }
+
+    Timer {
+        id: scrollSync
+        interval: 0
+        onTriggered: {
+            win.alignScroll(null);
+            if (win.cursorEnsurePending) {
+                win.cursorEnsurePending = false;
+                editorFlick.ensureCursorVisible();
+            }
+        }
+    }
+
+    Timer {
+        id: previewUpdate
+        interval: 0
+        onTriggered: {
+            if (renderedPreview.baseUrl.toString() !== backend.previewBaseUrl.toString()) {
+                // File transitions replace text before publishing the new path.
+                // Update together after that transition, avoiding stale image URLs.
+                renderedPreview.text = "";
+                renderedPreview.baseUrl = backend.previewBaseUrl;
+            }
+            renderedPreview.text = editor.text;
+            backend.formatPreviewDocument(renderedPreview.textDocument, win.editorFontPixelSize, editor.text);
+        }
+    }
+    Connections {
+        target: editor
+        function onTextChanged() { previewUpdate.restart(); }
+    }
+    Connections {
+        target: backend
+        function onFileUrlChanged() { previewUpdate.restart(); }
+    }
+
+    function focusDocument() {
+        if (viewMode === "preview") renderedPreview.forceActiveFocus();
+        else editor.forceActiveFocus();
+    }
+
+    function openSearch(replace) {
+        if (viewMode === "preview") backend.viewMode = "split";
+        searchOpen = true;
+        replaceOpen = replace;
+        searchField.forceActiveFocus();
+        searchField.selectAll();
+    }
+
+    onViewModeChanged: {
+        scrollSync.restart();
+        if (viewMode === "preview" && searchOpen) closeSearch();
+        Qt.callLater(function() {
+            if (!win.searchOpen) win.focusDocument();
+        });
+    }
     property bool closeConfirmed: false
     property bool searchOpen: false
     property bool searchUpdating: false
@@ -112,7 +193,7 @@ ApplicationWindow {
         editor.deselect();
         searchUpdating = false;
         replaceOpen = false;
-        editor.forceActiveFocus();
+        win.focusDocument();
     }
 
     Shortcut {
@@ -125,28 +206,28 @@ ApplicationWindow {
         sequence: "Ctrl+H"
         context: Qt.ApplicationShortcut
         onActivated: {
-            searchOpen = true;
-            replaceOpen = true;
-            searchField.forceActiveFocus();
-            searchField.selectAll();
+            win.openSearch(true);
         }
     }
 
     Shortcut {
         sequence: "Ctrl+B"
         context: Qt.WindowShortcut
+        enabled: win.viewMode !== "preview" && editor.activeFocus
         onActivated: editor.wrapSelection("**", "**")
     }
 
     Shortcut {
         sequence: "Ctrl+I"
         context: Qt.WindowShortcut
+        enabled: win.viewMode !== "preview" && editor.activeFocus
         onActivated: editor.wrapSelection("*", "*")
     }
 
     Shortcut {
         sequence: "Ctrl+K"
         context: Qt.WindowShortcut
+        enabled: win.viewMode !== "preview" && editor.activeFocus
         onActivated: editor.insertLink()
     }
 
@@ -189,12 +270,14 @@ ApplicationWindow {
     Shortcut {
         sequence: "Ctrl+Z"
         context: Qt.WindowShortcut
+        enabled: win.viewMode !== "preview" && editor.activeFocus
         onActivated: editor.undo()
     }
 
     Shortcut {
         sequences: ["Ctrl+Shift+Z", "Ctrl+Y"]
         context: Qt.WindowShortcut
+        enabled: win.viewMode !== "preview" && editor.activeFocus
         onActivated: editor.redo()
     }
 
@@ -202,9 +285,7 @@ ApplicationWindow {
         sequence: "Ctrl+F"
         context: Qt.ApplicationShortcut
         onActivated: {
-            searchOpen = true;
-            searchField.forceActiveFocus();
-            searchField.selectAll();
+            win.openSearch(false);
         }
     }
 
@@ -323,462 +404,427 @@ ApplicationWindow {
     Item {
         anchors.fill: parent
 
-        Flickable {
-            id: editorFlick
+        SplitView {
+            id: documentSplit
+            objectName: "documentSplit"
             anchors.fill: parent
             anchors.leftMargin: 24
             anchors.rightMargin: 24
-            // Inset the scrolling area by the footer strip at both ends, so
-            // scrolled text never runs under the footer buttons, status, or
-            // word count, and stops just as far short of the top edge.
             anchors.topMargin: win.footerHeight
             anchors.bottomMargin: win.footerHeight
-            clip: true
-            contentWidth: width
-            contentHeight: Math.max(height, editor.y + editor.implicitHeight + 220)
-            boundsBehavior: Flickable.StopAtBounds
-            ScrollBar.vertical: ScrollBar {
-                policy: ScrollBar.AsNeeded
-                // Wheel scrolling moves contentY directly rather than
-                // flicking the Flickable, so the bar has to be told about
-                // that activity; linger briefly after the last event.
-                active: hovered || pressed || wheelScroll.running || scrollLinger.running
+            orientation: Qt.Horizontal
+            property real usableWidth: Math.max(1, width - win.scaledSize(6))
+            onResizingChanged: {
+                if (!resizing && win.viewMode === "split")
+                    backend.splitRatio = sourcePane.width / usableWidth;
             }
-
-            Timer {
-                id: scrollLinger
-                interval: 600
+            onWidthChanged: restoreSplitWidth()
+            function restoreSplitWidth() {
+                if (!resizing)
+                    sourcePane.SplitView.preferredWidth = usableWidth * backend.splitRatio;
             }
-
-            // Flickable turns a wheel notch into a flick sized by the small
-            // application font, which crawls next to a browser. Reproduce
-            // Chromium's wheel physics instead (cc::ScrollOffsetAnimationCurve):
-            // each notch moves 3 lines of 40px towards a running target, the
-            // animation gets shorter as the outstanding distance grows, and a
-            // notch landing mid-animation carries the current velocity into
-            // the new curve, so sustained spinning keeps picking up speed.
-            readonly property real wheelStep: win.scaledSize(120)
-
-            FrameAnimation {
-                id: wheelScroll
-                running: false
-
-                property real startY: 0
-                property real targetY: 0
-                property real duration: 0.2
-                // Cubic bezier easing; ease-in-out (0.42, 0, 0.58, 1) for a
-                // fresh scroll, with y1 tilted on retarget so the curve's
-                // initial slope matches the velocity it inherits.
-                property real cx1: 0.42
-                property real cy1: 0
-                readonly property real cx2: 0.58
-                readonly property real cy2: 1
-
-                onTriggered: {
-                    var x = elapsedTime / duration;
-                    if (x >= 1) {
-                        editorFlick.contentY = editorFlick.snapToPixel(targetY);
-                        stop();
-                        return;
-                    }
-                    editorFlick.contentY = editorFlick.snapToPixel(
-                        startY + (targetY - startY) * curveY(solveCurve(x)));
-                }
-
-                function begin(from, to, dur, slope) {
-                    startY = from;
-                    targetY = to;
-                    duration = dur;
-                    cx1 = 0.42;
-                    cy1 = 0.42 * Math.max(-1000, Math.min(1000, slope));
-                    restart();
-                }
-
-                function retarget(newTarget) {
-                    var s = solveCurve(Math.min(1, elapsedTime / duration));
-                    var pos = startY + (targetY - startY) * curveY(s);
-                    var delta = newTarget - pos;
-                    if (Math.abs(delta) < 0.5) {
-                        editorFlick.contentY = newTarget;
-                        stop();
-                        return;
-                    }
-
-                    var velocity = curveDY(s) / Math.max(1e-6, curveDX(s))
-                        * (targetY - startY) / duration;
-                    var dur = editorFlick.wheelDuration(delta);
-                    // When already moving faster than the eased curve would,
-                    // bound the duration by the time to target at the current
-                    // velocity; the 2.5x covers the ease-out tail.
-                    if (velocity !== 0 && delta / velocity > 0)
-                        dur = Math.min(dur, delta / velocity * 2.5);
-                    begin(pos, newTarget, dur, velocity * dur / delta);
-                }
-
-                // Cubic bezier through (0,0), (cx1,cy1), (cx2,cy2), (1,1),
-                // evaluated by Newton-solving the curve parameter from x.
-                function curveX(s) { return 3 * s * (1 - s) * ((1 - s) * cx1 + s * cx2) + s * s * s; }
-                function curveY(s) { return 3 * s * (1 - s) * ((1 - s) * cy1 + s * cy2) + s * s * s; }
-                function curveDX(s) { return 3 * (1 - s) * (1 - s) * cx1 + 6 * (1 - s) * s * (cx2 - cx1) + 3 * s * s * (1 - cx2); }
-                function curveDY(s) { return 3 * (1 - s) * (1 - s) * cy1 + 6 * (1 - s) * s * (cy2 - cy1) + 3 * s * s * (1 - cy2); }
-
-                function solveCurve(x) {
-                    var s = x;
-                    for (var i = 0; i < 8; ++i) {
-                        var error = curveX(s) - x;
-                        if (Math.abs(error) < 0.001)
-                            break;
-                        var d = curveDX(s);
-                        if (Math.abs(d) < 1e-6)
-                            break;
-                        s = Math.max(0, Math.min(1, s - error / d));
-                    }
-                    return s;
-                }
+            Connections {
+                target: backend
+                function onViewModeChanged() { documentSplit.restoreSplitWidth(); }
+                function onSplitRatioChanged() { documentSplit.restoreSplitWidth(); }
             }
-
-            WheelHandler {
-                // Wayland compositors route every pointer's scroll through
-                // one seat device that Qt classifies as a touchpad, so the
-                // device type cannot tell a mouse wheel from two-finger
-                // scrolling. Distinguish by event shape instead: discrete
-                // wheel notches arrive with only angleDelta set, while
-                // finger scrolling carries pixel-precise pixelDelta.
-                acceptedDevices: PointerDevice.Mouse | PointerDevice.TouchPad
-                onWheel: function(wheel) {
-                    scrollLinger.restart();
-                    if (wheel.pixelDelta.y !== 0)
-                        editorFlick.scrollTo(editorFlick.clampContentY(editorFlick.contentY - wheel.pixelDelta.y));
-                    else
-                        editorFlick.scrollByWheel(wheel);
-                    wheel.accepted = true;
-                }
-            }
-
-            onMovementStarted: wheelScroll.stop()
-
-            function scrollByWheel(wheel) {
-                // High-resolution wheels report fractional notches; feed
-                // those through the same animated path, like Chromium does
-                // for every wheel-source event.
-                var notches = wheel.angleDelta.y / 120;
-                if (notches === 0)
-                    return;
-
-                if (wheelScroll.running) {
-                    wheelScroll.retarget(clampContentY(wheelScroll.targetY - notches * wheelStep));
-                    return;
-                }
-
-                var target = clampContentY(contentY - notches * wheelStep);
-                if (target !== contentY)
-                    wheelScroll.begin(contentY, target, wheelDuration(target - contentY), 0);
-            }
-
-            // Chromium's inverse-delta duration: 200ms for a single notch,
-            // ramping down to 100ms once 480px are outstanding.
-            function wheelDuration(delta) {
-                var pixels = Math.abs(delta) / win.textScale;
-                return Math.max(6, Math.min(12, 14 - pixels / 60)) / 60;
-            }
-
-            function clampContentY(y) {
-                return Math.max(0, Math.min(Math.max(0, contentHeight - height), y));
-            }
-
-            // Whole device pixels keep natively hinted glyphs from
-            // re-rasterizing mid-animation, which reads as shimmer.
-            function snapToPixel(y) {
-                return Math.round(y * Screen.devicePixelRatio) / Screen.devicePixelRatio;
-            }
-
-            // Jump to a position, abandoning any wheel animation still running.
-            function scrollTo(y) {
-                wheelScroll.stop();
-                contentY = snapToPixel(y);
-            }
-
-            // Keep the editing caret within the viewport so writing past the
-            // bottom edge scrolls the page along with the text.
-            function ensureCursorVisible() {
-                var margin = win.editorFontPixelSize * 2;
-                var cursorTop = editor.y + editor.cursorRectangle.y;
-                var cursorBottom = cursorTop + editor.cursorRectangle.height;
-                var maxContentY = Math.max(0, contentHeight - height);
-
-                if (cursorBottom + margin > contentY + height)
-                    scrollTo(Math.min(maxContentY, cursorBottom + margin - height));
-                else if (cursorTop - margin < contentY)
-                    scrollTo(Math.max(0, cursorTop - margin));
-            }
-
-            TextEdit {
-                id: editor
-                objectName: "sourceEditor"
-                x: Math.round((editorFlick.width - width) / 2)
-                // The resting position counts from the window's top edge, so
-                // take back the top inset the Flickable already adds.
-                y: Math.max(0, Math.max(42, Math.round(win.height * 0.05)) - win.footerHeight)
-                width: win.editorWidth
-                height: Math.max(editorFlick.height - y - 96, implicitHeight + 20)
-                text: ""
-                textFormat: TextEdit.PlainText
-                wrapMode: TextEdit.Wrap
-                selectByMouse: true
-                persistentSelection: true
-                activeFocusOnPress: true
-                color: win.textColor
-                selectedTextColor: win.strongTextColor
-                selectionColor: win.selectionFill
-                font.family: backend.editorFont
-                font.pixelSize: win.editorFontPixelSize
-                font.weight: Font.Normal
-                // Native rendering hints glyphs to the pixel grid, which is
-                // crispest at whole scale factors but misplaces and unevenly
-                // rasterizes glyphs at fractional ones (and goes stale when
-                // the compositor delivers the fractional scale after the
-                // first frame). Fall back to Qt's scalable renderer there.
-                renderType: Screen.devicePixelRatio % 1 === 0 ? TextEdit.NativeRendering : TextEdit.QtRendering
-                cursorDelegate: Rectangle {
+            handle: Rectangle {
+                implicitWidth: win.scaledSize(6)
+                color: "transparent"
+                Rectangle {
+                    anchors.centerIn: parent
                     width: 1
-                    color: win.strongTextColor
+                    height: parent.height
+                    color: backend.themeAccent
+                    opacity: SplitHandle.pressed ? 0.8 : SplitHandle.hovered ? 0.5 : 0.18
                 }
-                onCursorRectangleChanged: editorFlick.ensureCursorVisible()
-                onFontChanged: backend.documentFontChanged()
+            }
 
-                function replaceSelectionWith(replacement) {
-                    var start = Math.min(selectionStart, selectionEnd);
-                    var end = Math.max(selectionStart, selectionEnd);
-                    EditorMutations.replaceRange(editor, start, end, replacement);
-                }
+            Item {
+                id: sourcePane
+                objectName: "sourcePane"
+                visible: win.viewMode !== "preview"
+                onWidthChanged: scrollSync.restart()
+                SplitView.minimumWidth: win.viewMode === "split"
+                    ? Math.min(win.scaledSize(220), documentSplit.usableWidth / 2) : 0
+                SplitView.fillWidth: win.viewMode === "source"
 
-                function wrapSelection(before, after) {
-                    forceActiveFocus();
-                    var start = Math.min(selectionStart, selectionEnd);
-                    var end = Math.max(selectionStart, selectionEnd);
-                    var selected = text.slice(start, end);
-                    EditorMutations.replaceRange(editor, start, end,
-                                                 before + selected + after,
-                                                 before.length,
-                                                 before.length + selected.length);
-                }
+                DocumentViewport {
+                    id: editorFlick
+                    objectName: "sourceViewport"
+                    anchors.fill: parent
+                    textScale: win.textScale
+                    contentWidth: width
+                    contentHeight: Math.max(height, editor.y + editor.implicitHeight + 220)
+                    onContentYChanged: win.trackScroll(editorFlick)
+                    onScrollNavigated: win.trackScroll(editorFlick, true)
+                    onContentHeightChanged: scrollSync.restart()
+                    onHeightChanged: scrollSync.restart()
+                    // Keep the editing caret within the viewport so writing past the
+                    // bottom edge scrolls the page along with the text.
+                    function ensureCursorVisible() {
+                        if (!sourcePane.visible || scrollSync.running) return;
+                        var margin = win.editorFontPixelSize * 2;
+                        var cursorTop = editor.y + editor.cursorRectangle.y;
+                        var cursorBottom = cursorTop + editor.cursorRectangle.height;
+                        var maxContentY = Math.max(0, contentHeight - height);
 
-                function insertLink() {
-                    var start = Math.min(selectionStart, selectionEnd);
-                    var end = Math.max(selectionStart, selectionEnd);
-                    var selected = text.slice(start, end);
-                    var url = backend.clipboardUrl();
-                    var label = selected.length > 0 ? selected : "link text";
-                    var destination = url.length > 0 ? url : "https://";
-                    var escapedLabel = escapeMarkdownLinkText(label);
-                    var markdown = "[" + escapedLabel + "](" + escapeMarkdownLinkDestination(destination) + ")";
-                    if (selected.length === 0) {
-                        EditorMutations.replaceRange(editor, start, end, markdown,
-                                                     1, 1 + escapedLabel.length);
-                    } else if (url.length === 0) {
-                        EditorMutations.replaceRange(editor, start, end, markdown,
-                                                     escapedLabel.length + 3,
-                                                     markdown.length - 1);
-                    } else {
-                        EditorMutations.replaceRange(editor, start, end, markdown);
+                        if (cursorBottom + margin > contentY + height)
+                            scrollTo(Math.min(maxContentY, cursorBottom + margin - height));
+                        else if (cursorTop - margin < contentY)
+                            scrollTo(Math.max(0, cursorTop - margin));
                     }
-                }
 
-                function smartReturn(softBreak) {
-                    if (softBreak) {
-                        replaceSelectionWith("\n");
-                        return;
-                    }
-                    var lineStart = text.lastIndexOf("\n", cursorPosition - 1) + 1;
-                    var line = text.slice(lineStart, cursorPosition);
-                    var before = text.slice(0, cursorPosition);
-                    var fences = (before.match(/^\s*```/gm) || []).length;
-                    if ((fences % 2) === 1) {
-                        replaceSelectionWith("\n");
-                        return;
-                    }
-                    var match = line.match(/^(\s*)([-+*]|\d+[.)]|>+)\s+(.*)$/);
-                    if (match) {
-                        if (match[3].length === 0) {
-                            EditorMutations.replaceRange(editor, lineStart,
-                                                         cursorPosition, "\n");
-                        } else {
-                            var marker = match[2];
-                            if (/^\d/.test(marker))
-                                marker = (parseInt(marker) + 1) + marker.slice(-1);
-                            replaceSelectionWith("\n" + match[1] + marker + " ");
+                    TextEdit {
+                        id: editor
+                        objectName: "sourceEditor"
+                        x: Math.round((editorFlick.width - width) / 2)
+                        // The resting position counts from the window's top edge, so
+                        // take back the top inset the Flickable already adds.
+                        y: Math.max(0, Math.max(42, Math.round(win.height * 0.05)) - win.footerHeight)
+                        width: win.pageWidth(editorFlick.width)
+                        height: Math.max(editorFlick.height - y - 96, implicitHeight + 20)
+                        text: ""
+                        textFormat: TextEdit.PlainText
+                        wrapMode: TextEdit.Wrap
+                        selectByMouse: true
+                        persistentSelection: true
+                        activeFocusOnPress: true
+                        color: win.textColor
+                        selectedTextColor: win.strongTextColor
+                        selectionColor: win.selectionFill
+                        font.family: backend.editorFont
+                        font.pixelSize: win.editorFontPixelSize
+                        font.weight: Font.Normal
+                        // Native rendering hints glyphs to the pixel grid, which is
+                        // crispest at whole scale factors but misplaces and unevenly
+                        // rasterizes glyphs at fractional ones (and goes stale when
+                        // the compositor delivers the fractional scale after the
+                        // first frame). Fall back to Qt's scalable renderer there.
+                        renderType: Screen.devicePixelRatio % 1 === 0 ? TextEdit.NativeRendering : TextEdit.QtRendering
+                        cursorDelegate: Rectangle {
+                            width: 1
+                            color: win.strongTextColor
                         }
-                        return;
-                    }
-                    replaceSelectionWith("\n\n");
-                }
+                        // Reflow changes the caret rectangle without user
+                        // navigation. Keep the reading position during resizing.
+                        onCursorRectangleChanged: {
+                            if (win.cursorEnsurePending) editorFlick.ensureCursorVisible();
+                        }
+                        onCursorPositionChanged: {
+                            win.cursorEnsurePending = true;
+                            scrollSync.restart();
+                        }
+                        onPreeditTextChanged: {
+                            win.cursorEnsurePending = true;
+                            scrollSync.restart();
+                        }
+                        onFontChanged: backend.documentFontChanged()
 
-                function escapeMarkdownLinkText(linkText) {
-                    return linkText.replace(/\\/g, "\\\\")
-                                   .replace(/\[/g, "\\[")
-                                   .replace(/\]/g, "\\]");
-                }
+                        function replaceSelectionWith(replacement) {
+                            var start = Math.min(selectionStart, selectionEnd);
+                            var end = Math.max(selectionStart, selectionEnd);
+                            EditorMutations.replaceRange(editor, start, end, replacement);
+                        }
 
-                function escapeMarkdownLinkDestination(linkUrl) {
-                    return linkUrl.replace(/\\/g, "\\\\")
-                                  .replace(/\(/g, "\\(")
-                                  .replace(/\)/g, "\\)");
-                }
+                        function wrapSelection(before, after) {
+                            forceActiveFocus();
+                            var start = Math.min(selectionStart, selectionEnd);
+                            var end = Math.max(selectionStart, selectionEnd);
+                            var selected = text.slice(start, end);
+                            EditorMutations.replaceRange(editor, start, end,
+                                                         before + selected + after,
+                                                         before.length,
+                                                         before.length + selected.length);
+                        }
 
-                function pasteClipboardUrlAsMarkdownLink() {
-                    var start = Math.min(selectionStart, selectionEnd);
-                    var end = Math.max(selectionStart, selectionEnd);
-                    if (start === end)
-                        return false;
+                        function insertLink() {
+                            var start = Math.min(selectionStart, selectionEnd);
+                            var end = Math.max(selectionStart, selectionEnd);
+                            var selected = text.slice(start, end);
+                            var url = backend.clipboardUrl();
+                            var label = selected.length > 0 ? selected : "link text";
+                            var destination = url.length > 0 ? url : "https://";
+                            var escapedLabel = escapeMarkdownLinkText(label);
+                            var markdown = "[" + escapedLabel + "](" + escapeMarkdownLinkDestination(destination) + ")";
+                            if (selected.length === 0) {
+                                EditorMutations.replaceRange(editor, start, end, markdown,
+                                                             1, 1 + escapedLabel.length);
+                            } else if (url.length === 0) {
+                                EditorMutations.replaceRange(editor, start, end, markdown,
+                                                             escapedLabel.length + 3,
+                                                             markdown.length - 1);
+                            } else {
+                                EditorMutations.replaceRange(editor, start, end, markdown);
+                            }
+                        }
 
-                    var url = backend.clipboardUrl();
-                    if (url === "")
-                        return false;
+                        function smartReturn(softBreak) {
+                            if (softBreak) {
+                                replaceSelectionWith("\n");
+                                return;
+                            }
+                            var lineStart = text.lastIndexOf("\n", cursorPosition - 1) + 1;
+                            var line = text.slice(lineStart, cursorPosition);
+                            var before = text.slice(0, cursorPosition);
+                            var fences = (before.match(/^\s*```/gm) || []).length;
+                            if ((fences % 2) === 1) {
+                                replaceSelectionWith("\n");
+                                return;
+                            }
+                            var match = line.match(/^(\s*)([-+*]|\d+[.)]|>+)\s+(.*)$/);
+                            if (match) {
+                                if (match[3].length === 0) {
+                                    EditorMutations.replaceRange(editor, lineStart,
+                                                                 cursorPosition, "\n");
+                                } else {
+                                    var marker = match[2];
+                                    if (/^\d/.test(marker))
+                                        marker = (parseInt(marker) + 1) + marker.slice(-1);
+                                    replaceSelectionWith("\n" + match[1] + marker + " ");
+                                }
+                                return;
+                            }
+                            replaceSelectionWith("\n\n");
+                        }
 
-                    var selected = text.slice(start, end);
-                    var leading = selected.match(/^\s*/)[0];
-                    var trailing = selected.match(/\s*$/)[0];
-                    var linkText = selected.slice(leading.length,
-                                                  selected.length - trailing.length);
-                    if (linkText === "")
-                        return false;
+                        function escapeMarkdownLinkText(linkText) {
+                            return linkText.replace(/\\/g, "\\\\")
+                                           .replace(/\[/g, "\\[")
+                                           .replace(/\]/g, "\\]");
+                        }
 
-                    replaceSelectionWith(leading + "[" + escapeMarkdownLinkText(linkText) + "]("
-                                         + escapeMarkdownLinkDestination(url) + ")" + trailing);
-                    return true;
-                }
+                        function escapeMarkdownLinkDestination(linkUrl) {
+                            return linkUrl.replace(/\\/g, "\\\\")
+                                          .replace(/\(/g, "\\(")
+                                          .replace(/\)/g, "\\)");
+                        }
 
-                function pasteClipboardAsPlainText() {
-                    var pastedText = backend.clipboardText();
-                    if (pastedText.length > 0)
-                        replaceSelectionWith(pastedText);
-                }
+                        function pasteClipboardUrlAsMarkdownLink() {
+                            var start = Math.min(selectionStart, selectionEnd);
+                            var end = Math.max(selectionStart, selectionEnd);
+                            if (start === end)
+                                return false;
 
-                function skipHiddenForward(position) {
-                    var pos = position;
-                    var ranges = backend.hiddenRangesAt(pos);
-                    for (var i = 0; i < ranges.length; i++) {
-                        if (pos >= ranges[i].start && pos < ranges[i].end) {
-                            pos = ranges[i].end;
-                            i = -1;
+                            var url = backend.clipboardUrl();
+                            if (url === "")
+                                return false;
+
+                            var selected = text.slice(start, end);
+                            var leading = selected.match(/^\s*/)[0];
+                            var trailing = selected.match(/\s*$/)[0];
+                            var linkText = selected.slice(leading.length,
+                                                          selected.length - trailing.length);
+                            if (linkText === "")
+                                return false;
+
+                            replaceSelectionWith(leading + "[" + escapeMarkdownLinkText(linkText) + "]("
+                                                 + escapeMarkdownLinkDestination(url) + ")" + trailing);
+                            return true;
+                        }
+
+                        function pasteClipboardAsPlainText() {
+                            var pastedText = backend.clipboardText();
+                            if (pastedText.length > 0)
+                                replaceSelectionWith(pastedText);
+                        }
+
+                        function skipHiddenForward(position) {
+                            var pos = position;
+                            var ranges = backend.hiddenRangesAt(pos);
+                            for (var i = 0; i < ranges.length; i++) {
+                                if (pos >= ranges[i].start && pos < ranges[i].end) {
+                                    pos = ranges[i].end;
+                                    i = -1;
+                                }
+                            }
+                            return pos;
+                        }
+
+                        function skipHiddenBackward(position) {
+                            var pos = position;
+                            var ranges = backend.hiddenRangesAt(pos);
+                            for (var i = ranges.length - 1; i >= 0; i--) {
+                                if (pos > ranges[i].start && pos <= ranges[i].end) {
+                                    pos = ranges[i].start;
+                                    i = ranges.length;
+                                }
+                            }
+                            return pos;
+                        }
+
+                        function moveCursorVisibly(direction) {
+                            if (selectionStart !== selectionEnd) {
+                                cursorPosition = direction > 0
+                                    ? Math.max(selectionStart, selectionEnd)
+                                    : Math.min(selectionStart, selectionEnd);
+                                return;
+                            }
+
+                            var pos = Math.max(0, Math.min(text.length, cursorPosition + direction));
+                            cursorPosition = direction > 0
+                                ? skipHiddenForward(pos)
+                                : skipHiddenBackward(pos);
+                        }
+
+                        function movePage(direction, extendSelection) {
+                            var pageStep = Math.max(win.editorFontPixelSize,
+                                                    editorFlick.height - win.editorFontPixelSize * 2);
+                            var rect = cursorRectangle;
+                            var targetY = rect.y + rect.height / 2 + direction * pageStep;
+                            var target = positionAt(rect.x, Math.max(0, targetY));
+                            if (extendSelection)
+                                moveCursorSelection(target, TextEdit.SelectCharacters);
+                            else
+                                cursorPosition = target;
+                        }
+
+                        function deleteParagraphBreakBehindCursor() {
+                            if (selectionStart !== selectionEnd || cursorPosition < 2)
+                                return false;
+
+                            if (text.slice(cursorPosition - 2, cursorPosition) !== "\n\n")
+                                return false;
+
+                            var start = cursorPosition - 2;
+                            remove(start, cursorPosition);
+                            cursorPosition = start;
+                            return true;
+                        }
+
+                        Keys.priority: Keys.BeforeItem
+                        Keys.onPressed: function(event) {
+                            var pasteKey = (event.key === Qt.Key_V)
+                                && (event.modifiers & Qt.ControlModifier)
+                                && !(event.modifiers & (Qt.AltModifier | Qt.MetaModifier | Qt.ShiftModifier));
+                            var shiftInsert = (event.key === Qt.Key_Insert)
+                                && (event.modifiers & Qt.ShiftModifier)
+                                && !(event.modifiers & (Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier));
+                            if (pasteKey || shiftInsert) {
+                                if (!pasteClipboardUrlAsMarkdownLink())
+                                    pasteClipboardAsPlainText();
+                                event.accepted = true;
+                                return;
+                            }
+
+                            var returnKey = event.key === Qt.Key_Return || event.key === Qt.Key_Enter;
+                            var commandModifier = event.modifiers & (Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier);
+                            if (returnKey && !commandModifier) {
+                                smartReturn(event.modifiers & Qt.ShiftModifier);
+                                event.accepted = true;
+                            } else if (!commandModifier && event.key === Qt.Key_Backspace
+                                       && deleteParagraphBreakBehindCursor()) {
+                                event.accepted = true;
+                            } else if (!commandModifier && !(event.modifiers & Qt.ShiftModifier)
+                                       && event.key === Qt.Key_Right) {
+                                moveCursorVisibly(1);
+                                event.accepted = true;
+                            } else if (!commandModifier && !(event.modifiers & Qt.ShiftModifier)
+                                       && event.key === Qt.Key_Left) {
+                                moveCursorVisibly(-1);
+                                event.accepted = true;
+                            } else if (!commandModifier
+                                       && (event.key === Qt.Key_PageDown || event.key === Qt.Key_PageUp)) {
+                                movePage(event.key === Qt.Key_PageDown ? 1 : -1,
+                                         event.modifiers & Qt.ShiftModifier);
+                                event.accepted = true;
+                            }
+                        }
+
+                        onTextChanged: {
+                            if (win.searchUpdating)
+                                return;
+                            var contentChanged = backend.editorTextChanged();
+                            if (win.searchOpen && contentChanged)
+                                win.updateSearch();
+                        }
+
+                        Text {
+                            anchors.left: parent.left
+                            anchors.top: parent.top
+                            text: "# Start writing"
+                            visible: editor.text.length === 0 && !editor.activeFocus
+                            color: win.mutedColor
+                            font.family: editor.font.family
+                            font.pixelSize: editor.font.pixelSize
+                            font.weight: editor.font.weight
+                        }
+
+                        Component.onCompleted: {
+                            backend.attachDocument(textDocument);
                         }
                     }
-                    return pos;
                 }
 
-                function skipHiddenBackward(position) {
-                    var pos = position;
-                    var ranges = backend.hiddenRangesAt(pos);
-                    for (var i = ranges.length - 1; i >= 0; i--) {
-                        if (pos > ranges[i].start && pos <= ranges[i].end) {
-                            pos = ranges[i].start;
-                            i = ranges.length;
-                        }
-                    }
-                    return pos;
-                }
+            }
 
-                function moveCursorVisibly(direction) {
-                    if (selectionStart !== selectionEnd) {
-                        cursorPosition = direction > 0
-                            ? Math.max(selectionStart, selectionEnd)
-                            : Math.min(selectionStart, selectionEnd);
-                        return;
-                    }
+            Item {
+                id: previewPane
+                objectName: "previewPane"
+                visible: win.viewMode !== "source"
+                onWidthChanged: scrollSync.restart()
+                SplitView.minimumWidth: win.viewMode === "split"
+                    ? Math.min(win.scaledSize(220), documentSplit.usableWidth / 2) : 0
+                SplitView.fillWidth: true
 
-                    var pos = Math.max(0, Math.min(text.length, cursorPosition + direction));
-                    cursorPosition = direction > 0
-                        ? skipHiddenForward(pos)
-                        : skipHiddenBackward(pos);
-                }
+                DocumentViewport {
+                    id: previewFlick
+                    objectName: "previewViewport"
+                    anchors.fill: parent
+                    textScale: win.textScale
+                    contentWidth: Math.max(width, renderedPreview.x + renderedPreview.contentWidth + win.scaledSize(12))
+                    contentHeight: Math.max(height, renderedPreview.y + renderedPreview.contentHeight + 220)
+                    onContentYChanged: win.trackScroll(previewFlick)
+                    onScrollNavigated: win.trackScroll(previewFlick, true)
+                    onContentHeightChanged: scrollSync.restart()
+                    onHeightChanged: scrollSync.restart()
+                    ScrollBar.horizontal: ScrollBar { policy: ScrollBar.AsNeeded }
 
-                function movePage(direction, extendSelection) {
-                    var pageStep = Math.max(win.editorFontPixelSize,
-                                            editorFlick.height - win.editorFontPixelSize * 2);
-                    var rect = cursorRectangle;
-                    var targetY = rect.y + rect.height / 2 + direction * pageStep;
-                    var target = positionAt(rect.x, Math.max(0, targetY));
-                    if (extendSelection)
-                        moveCursorSelection(target, TextEdit.SelectCharacters);
-                    else
-                        cursorPosition = target;
-                }
-
-                function deleteParagraphBreakBehindCursor() {
-                    if (selectionStart !== selectionEnd || cursorPosition < 2)
-                        return false;
-
-                    if (text.slice(cursorPosition - 2, cursorPosition) !== "\n\n")
-                        return false;
-
-                    var start = cursorPosition - 2;
-                    remove(start, cursorPosition);
-                    cursorPosition = start;
-                    return true;
-                }
-
-                Keys.priority: Keys.BeforeItem
-                Keys.onPressed: function(event) {
-                    var pasteKey = (event.key === Qt.Key_V)
-                        && (event.modifiers & Qt.ControlModifier)
-                        && !(event.modifiers & (Qt.AltModifier | Qt.MetaModifier | Qt.ShiftModifier));
-                    var shiftInsert = (event.key === Qt.Key_Insert)
-                        && (event.modifiers & Qt.ShiftModifier)
-                        && !(event.modifiers & (Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier));
-                    if (pasteKey || shiftInsert) {
-                        if (!pasteClipboardUrlAsMarkdownLink())
-                            pasteClipboardAsPlainText();
-                        event.accepted = true;
-                        return;
-                    }
-
-                    var returnKey = event.key === Qt.Key_Return || event.key === Qt.Key_Enter;
-                    var commandModifier = event.modifiers & (Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier);
-                    if (returnKey && !commandModifier) {
-                        smartReturn(event.modifiers & Qt.ShiftModifier);
-                        event.accepted = true;
-                    } else if (!commandModifier && event.key === Qt.Key_Backspace
-                               && deleteParagraphBreakBehindCursor()) {
-                        event.accepted = true;
-                    } else if (!commandModifier && !(event.modifiers & Qt.ShiftModifier)
-                               && event.key === Qt.Key_Right) {
-                        moveCursorVisibly(1);
-                        event.accepted = true;
-                    } else if (!commandModifier && !(event.modifiers & Qt.ShiftModifier)
-                               && event.key === Qt.Key_Left) {
-                        moveCursorVisibly(-1);
-                        event.accepted = true;
-                    } else if (!commandModifier
-                               && (event.key === Qt.Key_PageDown || event.key === Qt.Key_PageUp)) {
-                        movePage(event.key === Qt.Key_PageDown ? 1 : -1,
-                                 event.modifiers & Qt.ShiftModifier);
-                        event.accepted = true;
+                    TextEdit {
+                        id: renderedPreview
+                        objectName: "renderedPreview"
+                        x: Math.round((previewFlick.width - width) / 2)
+                        y: editor.y
+                        width: win.pageWidth(previewFlick.width)
+                        height: Math.max(previewFlick.height - y - 96, contentHeight + 20)
+                        text: ""
+                        textFormat: TextEdit.MarkdownText
+                        baseUrl: ""
+                        readOnly: true
+                        selectByMouse: true
+                        selectByKeyboard: true
+                        persistentSelection: true
+                        wrapMode: TextEdit.Wrap
+                        color: win.textColor
+                        selectionColor: win.selectionFill
+                        selectedTextColor: win.strongTextColor
+                        font.family: backend.editorFont
+                        font.pixelSize: win.editorFontPixelSize
+                        renderType: editor.renderType
+                        onFontChanged: previewUpdate.restart()
+                        onLinkActivated: function(link) { backend.openExternalUrl(link); }
+                        Accessible.name: "Markdown preview"
                     }
                 }
+            }
+            Component.onCompleted: restoreSplitWidth()
+        }
 
-                onTextChanged: {
-                    if (win.searchUpdating)
-                        return;
-                    var contentChanged = backend.editorTextChanged();
-                    if (win.searchOpen && contentChanged)
-                        win.updateSearch();
-                }
-
-                Text {
-                    anchors.left: parent.left
-                    anchors.top: parent.top
-                    text: "# Start writing"
-                    visible: editor.text.length === 0 && !editor.activeFocus
-                    color: win.mutedColor
-                    font.family: editor.font.family
-                    font.pixelSize: editor.font.pixelSize
-                    font.weight: editor.font.weight
-                }
-
-                Component.onCompleted: {
-                    backend.attachDocument(textDocument);
-                    forceActiveFocus();
-                }
+        ViewModeSelector {
+            id: modeToggle
+            objectName: "modeToggle"
+            anchors.horizontalCenter: parent.horizontalCenter
+            anchors.bottom: parent.bottom
+            anchors.bottomMargin: win.scaledSize(4)
+            textScale: win.textScale
+            mode: win.viewMode
+            textColor: win.mutedColor
+            accentColor: backend.themeAccent
+            onModeChosen: function(mode) {
+                backend.viewMode = mode;
+                Qt.callLater(function() {
+                    if (!win.searchOpen) win.focusDocument();
+                });
             }
         }
 
@@ -823,7 +869,7 @@ ApplicationWindow {
                 font.pixelSize: win.scaledSize(11)
                 visible: text !== ""
                 elide: Text.ElideRight
-                width: Math.min(360, win.width / 3)
+                width: Math.max(0, modeToggle.x - footerStatus.x - x - 12)
                 height: win.scaledSize(16)
                 verticalAlignment: Text.AlignVCenter
             }
@@ -845,7 +891,7 @@ ApplicationWindow {
             mutedColor: win.mutedColor
             highlightColor: backend.themeAccent
             onFontChosen: function(family) { backend.editorFont = family; }
-            onClosed: editor.forceActiveFocus()
+            onClosed: win.focusDocument()
         }
 
         Label {
@@ -1025,6 +1071,8 @@ ApplicationWindow {
         width = geometry.width;
         height = geometry.height;
         if (geometry.maximized) showMaximized();
+        previewUpdate.restart();
+        Qt.callLater(win.focusDocument);
     }
 
     Component.onDestruction: backend.saveWindowGeometry(x, y, width, height, visibility === Window.Maximized)

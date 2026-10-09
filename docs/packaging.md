@@ -1,7 +1,7 @@
 # Omascribe packages and releases
 
 The first Omascribe release is 0.7.0, continuing Omawrite's version sequence.
-The Arch package is `omascribe` 0.7.0-1. The executable, icon, desktop entry,
+The current release is 1.0.0; its Arch package is `omascribe` 1.0.0-1. The executable, icon, desktop entry,
 Qt application identity, settings, recovery and local control use Omascribe's
 own names. The package can coexist with the official `omawrite`; it does not
 provide, replace or conflict with that package. Original license notices are
@@ -29,8 +29,8 @@ For a build without installing or changing system packages:
 ```sh
 cd pkgbuild
 makepkg -f
-pacman -Qip omascribe-0.7.0-1-x86_64.pkg.tar.zst
-pacman -Qlp omascribe-0.7.0-1-x86_64.pkg.tar.zst
+pacman -Qip omascribe-1.0.0-1-x86_64.pkg.tar.zst
+pacman -Qlp omascribe-1.0.0-1-x86_64.pkg.tar.zst
 ```
 
 Use the clone on the development machine to test unpublished changes. Rerun
@@ -54,8 +54,8 @@ unchanged to AUR.
 
 On 2026-10-09 the maintainer reported that AUR has closed new account
 registrations. They do not yet have an AUR account, so publication is deferred.
-The verified 0.7.0 recipe is included in the GitHub release as
-`omascribe-0.7.0-1-aur.zip`, alongside the installable Arch package and checksums.
+The verified 1.0.0 recipe is included in the GitHub release as
+`omascribe-1.0.0-1-aur.zip`, alongside the installable Arch package and checksums.
 Use the development checkout or the GitHub package while AUR access is unavailable.
 These installations need manual updates until the package is published on AUR.
 
@@ -76,13 +76,13 @@ fixes increment it.
 2. Create the immutable `v<version>` tag on that verified commit and publish a
    GitHub release describing changes, verification and relevant limitations.
 3. Download the source archive for the published tag from GitHub. Use that exact
-   archive, not a local working-tree tarball. For 0.7.0:
+   archive, not a local working-tree tarball. For 1.0.0:
 
    ```sh
    mkdir -p .harness/downloads
-   curl --fail --location --output .harness/downloads/omascribe-0.7.0.tar.gz \
-     https://github.com/RolandDumit/omascribe/archive/refs/tags/v0.7.0.tar.gz
-   bin/harness prepare-aur --archive .harness/downloads/omascribe-0.7.0.tar.gz
+   curl --fail --location --output .harness/downloads/omascribe-1.0.0.tar.gz \
+     https://github.com/RolandDumit/omascribe/archive/refs/tags/v1.0.0.tar.gz
+   bin/harness prepare-aur --archive .harness/downloads/omascribe-1.0.0.tar.gz
    ```
 
 4. `prepare-aur` checks the archive's application version and local package

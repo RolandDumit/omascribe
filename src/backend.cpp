@@ -17,6 +17,7 @@
 #include <QQuickTextDocument>
 #include <QRegularExpression>
 #include <QSettings>
+#include <QSet>
 #include <QStandardPaths>
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -26,12 +27,15 @@
 #include <QTextBlockFormat>
 #include <QTextCursor>
 #include <QTextDocument>
+#include <QTextList>
+#include <QTextTable>
 #include <QTextStream>
 #include <QUrl>
 #include <QVariantMap>
 #include <QWindow>
 
 #include <algorithm>
+#include <cmath>
 
 #include "markdownhighlighter.h"
 #include "runtimeprofile.h"
@@ -39,6 +43,77 @@
 constexpr qreal typoraLineHeightPercent = 140;
 const QString lastSaveDirectorySetting = QStringLiteral("file/lastSaveDirectory");
 const QString editorFontSetting = QStringLiteral("editor/font");
+const QString viewModeSetting = QStringLiteral("editor/viewMode");
+const QString splitRatioSetting = QStringLiteral("editor/splitRatio");
+
+namespace {
+bool validViewMode(const QString &mode) {
+    return mode == QStringLiteral("source") || mode == QStringLiteral("split")
+        || mode == QStringLiteral("preview");
+}
+bool validSplitRatio(qreal ratio) {
+    return std::isfinite(ratio) && ratio > 0 && ratio < 1;
+}
+
+QVector<int> previewParagraphGroups(QTextDocument *document, const QString &markdown) {
+    QVector<int> groups(document->blockCount());
+    for (int i = 0; i < groups.size(); ++i) groups[i] = i;
+
+    // Qt represents Markdown hard breaks as new QTextBlocks. Ask its parser
+    // which blocks form one paragraph by comparing a copy with soft breaks;
+    // this keeps Markdown structure (lists, quotes, HTML, etc.) owned by Qt.
+    QString softMarkdown;
+    softMarkdown.reserve(markdown.size());
+    bool changed = false;
+    for (qsizetype start = 0; start < markdown.size();) {
+        const qsizetype newline = markdown.indexOf(QLatin1Char('\n'), start);
+        if (newline < 0) { softMarkdown += QStringView(markdown).mid(start); break; }
+        qsizetype end = newline;
+        while (end > start && markdown.at(end - 1) == QLatin1Char(' ')) --end;
+        if (newline - end >= 2) {
+            changed = true;
+        } else {
+            end = newline;
+            qsizetype slashes = 0;
+            while (end - slashes > start && markdown.at(end - slashes - 1) == QLatin1Char('\\')) ++slashes;
+            if (slashes % 2) { --end; changed = true; }
+        }
+        softMarkdown += QStringView(markdown).mid(start, end - start);
+        softMarkdown += QLatin1Char('\n');
+        start = newline + 1;
+    }
+    if (!changed) return groups;
+    QTextDocument softDocument;
+    softDocument.setMarkdown(softMarkdown);
+    QTextBlock original = document->begin();
+    for (QTextBlock soft = softDocument.begin(); soft.isValid() && original.isValid(); soft = soft.next()) {
+        const QString target = soft.text().simplified();
+        const QTextBlock first = original;
+        QTextBlock end = original;
+        qsizetype position = 0;
+        bool matched = false;
+        while (end.isValid()) {
+            const QString piece = end.text().simplified();
+            if (QStringView(target).mid(position, piece.size()) != QStringView(piece)) break;
+            position += piece.size();
+            if (position == target.size()) { matched = true; break; }
+            if (position >= target.size() || target.at(position) != QLatin1Char(' ')) break;
+            ++position;
+            end = end.next();
+        }
+        if (matched) {
+            for (QTextBlock part = first; part.isValid(); part = part.next()) {
+                groups[part.blockNumber()] = first.blockNumber();
+                if (part == end) break;
+            }
+            original = end.next();
+        } else {
+            original = original.next();
+        }
+    }
+    return groups;
+}
+}
 
 // Noto ships a separate family per script, which buries every other font in
 // the picker. Offer only the core Latin families; the rest still serve as
@@ -94,6 +169,12 @@ QString Backend::normalizedLinkUrl(const QString &clipboardText) {
 }
 
 Backend::Backend(QObject *parent) : QObject(parent) {
+    QSettings settings;
+    const QString savedMode = settings.value(viewModeSetting).toString();
+    if (validViewMode(savedMode)) m_viewMode = savedMode;
+    bool ratioOk = false;
+    const qreal savedRatio = settings.value(splitRatioSetting, 0.5).toDouble(&ratioOk);
+    if (ratioOk && validSplitRatio(savedRatio)) m_splitRatio = savedRatio;
     const QString savedFont = QSettings().value(editorFontSetting).toString();
     m_editorFont = !savedFont.isEmpty() && QFontDatabase::hasFamily(savedFont)
         ? savedFont
@@ -157,6 +238,28 @@ Backend::Backend(QObject *parent) : QObject(parent) {
 }
 
 Backend::~Backend() = default;
+
+void Backend::setViewMode(const QString &mode) {
+    if (!validViewMode(mode) || m_viewMode == mode) return;
+    m_viewMode = mode;
+    QSettings().setValue(viewModeSetting, mode);
+    emit viewModeChanged();
+}
+
+void Backend::setSplitRatio(qreal ratio) {
+    if (!validSplitRatio(ratio) || qFuzzyCompare(m_splitRatio, ratio)) return;
+    m_splitRatio = ratio;
+    QSettings().setValue(splitRatioSetting, ratio);
+    emit splitRatioChanged();
+}
+
+QUrl Backend::previewBaseUrl() const {
+    // Untitled drafts have no document directory. Keep resource lookup inside
+    // the application's data directory, including for isolated profiles.
+    const QString directory = m_fileUrl.isLocalFile()
+        ? QFileInfo(m_fileUrl.toLocalFile()).absolutePath() : RuntimeProfile::dataDirectory();
+    return QUrl::fromLocalFile(directory + QLatin1Char('/'));
+}
 
 void Backend::setParentWindow(QWindow *window) {
     m_parentWindow = window;
@@ -516,6 +619,82 @@ QStringList Backend::selectableFontFamilies(const QStringList &families) {
 void Backend::documentFontChanged() {
     if (m_highlighter)
         m_highlighter->refreshFont();
+}
+
+void Backend::formatPreviewDocument(QObject *textDocument, qreal fontPixelSize, const QString &markdown) {
+    auto *quickDocument = qobject_cast<QQuickTextDocument *>(textDocument);
+    QTextDocument *document = quickDocument ? quickDocument->textDocument() : nullptr;
+    if (!document || document == m_document || !std::isfinite(fontPixelSize) || fontPixelSize <= 0)
+        return;
+
+    // Markdown's paragraph defaults depend on pointSize(), which is -1 for
+    // our pixel-sized fonts. Set explicit, font-relative block margins on the
+    // read-only document, without changing line height or source formatting.
+    document->setUndoRedoEnabled(false);
+    QTextCursor edit(document);
+    edit.beginEditBlock();
+    const auto isCode = [](const QTextBlock &block) {
+        return block.isValid() && block.blockFormat().hasProperty(QTextFormat::BlockCodeLanguage);
+    };
+    const auto isList = [](const QTextBlock &block) {
+        return block.isValid() && (block.textList() || block.blockFormat().indent() > 0);
+    };
+    const QVector<int> groups = previewParagraphGroups(document, markdown);
+    const auto sameParagraph = [&groups](const QTextBlock &left, const QTextBlock &right) {
+        return left.isValid() && right.isValid()
+            && groups.at(left.blockNumber()) == groups.at(right.blockNumber());
+    };
+    QSet<QTextTable *> tables;
+    for (QTextBlock block = document->begin(); block.isValid(); block = block.next()) {
+        QTextCursor cursor(block);
+        QTextBlockFormat format = block.blockFormat();
+        qreal top = 0;
+        qreal bottom = fontPixelSize;
+        if (QTextTable *table = cursor.currentTable()) {
+            // The frame separates the table from surrounding blocks; cells
+            // should not each inherit the margins of an ordinary paragraph.
+            tables.insert(table);
+            bottom = 0;
+            // The importer can leave an empty leading paragraph in a cell.
+            // It is structural padding, not an extra rendered line.
+            if (block.text().isEmpty() && block.next().isValid()
+                    && table->cellAt(block.position()) == table->cellAt(block.next().position()))
+                format.setLineHeight(0, QTextBlockFormat::FixedHeight);
+        } else if (block.text().isEmpty() && block.previous().isValid()
+                   && QTextCursor(block.previous()).currentTable()) {
+            // QTextDocument requires a paragraph after a table frame. Let
+            // the frame margin provide its spacing without an empty line.
+            bottom = 0;
+            format.setLineHeight(0, QTextBlockFormat::FixedHeight);
+        } else if (format.headingLevel() > 0) {
+            top = 1.5 * fontPixelSize;
+        } else if (isCode(block)) {
+            top = isCode(block.previous()) ? 0 : fontPixelSize;
+            bottom = isCode(block.next()) ? 0 : fontPixelSize;
+        } else if (block.textList()) {
+            top = isList(block.previous()) ? 0.25 * fontPixelSize : 0;
+            bottom = isList(block.next()) ? 0 : fontPixelSize;
+        } else if (isList(block)) {
+            // A separate paragraph inside a list item still needs separation.
+            top = fontPixelSize;
+        } else if (format.hasProperty(QTextFormat::BlockTrailingHorizontalRulerWidth)) {
+            top = fontPixelSize;
+        }
+        if (sameParagraph(block.previous(), block)) top = 0;
+        if (sameParagraph(block, block.next())) bottom = 0;
+        if (block == document->begin()) top = 0;
+        if (!block.next().isValid()) bottom = 0;
+        format.setTopMargin(top);
+        format.setBottomMargin(bottom);
+        cursor.setBlockFormat(format);
+    }
+    for (QTextTable *table : tables) {
+        QTextTableFormat format = table->format();
+        format.setTopMargin(fontPixelSize);
+        format.setBottomMargin(fontPixelSize);
+        table->setFormat(format);
+    }
+    edit.endEditBlock();
 }
 
 void Backend::loadDocumentText(const QString &text) {

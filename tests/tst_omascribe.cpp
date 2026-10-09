@@ -1,5 +1,6 @@
 #include <QtTest>
 #include <QApplication>
+#include <QAbstractTextDocumentLayout>
 #include <QFile>
 #include <QFont>
 #include <QImage>
@@ -12,6 +13,13 @@
 #include <QQmlContext>
 #include <QQmlEngine>
 #include <QQuickItem>
+#include <QQuickTextDocument>
+#include <QClipboard>
+#include <QTextBlock>
+#include <QTextCursor>
+#include <QTextDocument>
+#include <QTextTable>
+#include <limits>
 #include <QQuickWindow>
 #include <QSettings>
 #include <QUuid>
@@ -227,6 +235,308 @@ private slots:
         QSettings().setValue(QStringLiteral("editor/font"), QStringLiteral("No Such Font"));
         QCOMPARE(Backend().editorFont(), Backend::defaultEditorFont());
     }
+    void remembersViewPreferencesInIsolatedProfiles() {
+        {
+            Backend backend;
+            QCOMPARE(backend.viewMode(), QStringLiteral("source"));
+            QCOMPARE(backend.splitRatio(), 0.5);
+            backend.setViewMode("split");
+            backend.setSplitRatio(0.65);
+            backend.setViewMode("invalid");
+            backend.setSplitRatio(std::numeric_limits<qreal>::quiet_NaN());
+            QCOMPARE(backend.viewMode(), QStringLiteral("split"));
+            QCOMPARE(backend.splitRatio(), 0.65);
+        }
+        QCOMPARE(Backend().viewMode(), QStringLiteral("split"));
+        QCOMPARE(Backend().splitRatio(), 0.65);
+        QTemporaryDir otherProfile;
+        QString error;
+        QVERIFY(RuntimeProfile::configure(otherProfile.path(), &error));
+        QCOMPARE(Backend().viewMode(), QStringLiteral("source"));
+        QCOMPARE(Backend().splitRatio(), 0.5);
+        QVERIFY(RuntimeProfile::configure(m_profile->path(), &error));
+        QSettings().setValue("editor/viewMode", "unknown");
+        QSettings().setValue("editor/splitRatio", "not a number");
+        QCOMPARE(Backend().viewMode(), QStringLiteral("source"));
+        QCOMPARE(Backend().splitRatio(), 0.5);
+    }
+    void restoresViewsAndRecoveredPreview() {
+        for (const QString &mode : {QStringLiteral("split"), QStringLiteral("preview")}) {
+            QSettings().setValue("editor/viewMode", mode);
+            QSettings().setValue("editor/splitRatio", 0.6);
+            UiFixture fixture;
+            QVERIFY2(fixture.load(m_qmlWarnings), qPrintable(fixture.error));
+            QVERIFY(QTest::qWaitForWindowExposed(fixture.window.get()));
+            QCOMPARE(fixture.backend.viewMode(), mode);
+            QTRY_VERIFY(fixture.find(mode == "preview" ? "renderedPreview" : "sourceEditor")
+                            ->property("activeFocus").toBool());
+            if (mode == "split") {
+                auto *source = fixture.find("sourcePane");
+                auto *split = fixture.find("documentSplit");
+                QTRY_VERIFY(qAbs(source->property("width").toReal()
+                    / split->property("usableWidth").toReal() - 0.6) < 0.01);
+            }
+        }
+        const QString text = "# Recovered preview\n\nA **draft**.\n";
+        QVERIFY(writeFile(QDir(RuntimeProfile::dataDirectory()).filePath("recovery-0.json"),
+                          QJsonDocument(QJsonObject{{"text", text}}).toJson()));
+        UiFixture recovered;
+        QVERIFY2(recovered.load(m_qmlWarnings), qPrintable(recovered.error));
+        auto *quickDocument = recovered.find("renderedPreview")->property("textDocument")
+                                  .value<QQuickTextDocument *>();
+        QVERIFY(quickDocument);
+        QTRY_VERIFY(quickDocument->textDocument()->toPlainText().startsWith("Recovered preview"));
+        QVERIFY(recovered.backend.modified());
+        QCOMPARE(recovered.state().value("text").toString(), text);
+    }
+    void switchesViewsWithoutChangingDocument() {
+        UiFixture fixture;
+        QVERIFY2(fixture.load(m_qmlWarnings), qPrintable(fixture.error));
+        QVERIFY(QTest::qWaitForWindowExposed(fixture.window.get()));
+        QVERIFY(fixture.replace(0, 0, "# Heading\n\n**bold** and *italic*\n").value("ok").toBool());
+        QVERIFY(fixture.command("select", {{"start", 2}, {"end", 9}}).value("ok").toBool());
+        const auto before = fixture.state();
+        auto *editor = fixture.find("sourceEditor");
+        auto *preview = fixture.find("renderedPreview");
+        auto clickMode = [&](const char *name) {
+            auto *button = qobject_cast<QQuickItem *>(fixture.find(name));
+            if (!button) return false;
+            QTest::mouseClick(fixture.window.get(), Qt::LeftButton, Qt::NoModifier,
+                             button->mapToScene(QPointF(button->width()/2, button->height()/2)).toPoint());
+            return true;
+        };
+        QVERIFY(clickMode("splitModeButton"));
+        QTRY_COMPARE(fixture.backend.viewMode(), QStringLiteral("split"));
+        QVERIFY(clickMode("splitModeButton"));
+        QVERIFY(fixture.find("splitModeButton")->property("checked").toBool());
+        QTRY_VERIFY(editor->property("activeFocus").toBool());
+        QVERIFY(fixture.find("sourcePane")->property("visible").toBool());
+        QVERIFY(fixture.find("previewPane")->property("visible").toBool());
+        QCOMPARE(fixture.state().value("version"), before.value("version"));
+        QCOMPARE(fixture.state().value("selectionStart"), before.value("selectionStart"));
+        QCOMPARE(fixture.state().value("selectionEnd"), before.value("selectionEnd"));
+        QVERIFY(clickMode("previewModeButton"));
+        QTRY_COMPARE(fixture.backend.viewMode(), QStringLiteral("preview"));
+        QTRY_VERIFY(preview->property("activeFocus").toBool());
+        QVERIFY(!editor->property("visible").toBool());
+        QVERIFY(preview->property("readOnly").toBool());
+        QTest::keyClick(fixture.window.get(), Qt::Key_B, Qt::ControlModifier);
+        QTest::keyClick(fixture.window.get(), Qt::Key_Z, Qt::ControlModifier);
+        QTest::keyClick(fixture.window.get(), Qt::Key_X);
+        QCOMPARE(fixture.state().value("text"), before.value("text"));
+        QCOMPARE(fixture.state().value("version"), before.value("version"));
+        QVERIFY(clickMode("sourceModeButton"));
+        QTRY_COMPARE(fixture.backend.viewMode(), QStringLiteral("source"));
+        QTRY_VERIFY(editor->property("activeFocus").toBool());
+        QCOMPARE(fixture.state().value("selectionStart"), before.value("selectionStart"));
+        QCOMPARE(fixture.state().value("selectionEnd"), before.value("selectionEnd"));
+        QCOMPARE(fixture.state().value("canUndo"), before.value("canUndo"));
+        QVERIFY(fixture.command("undo").value("ok").toBool());
+        QCOMPARE(fixture.state().value("text").toString(), QString());
+        QVERIFY(fixture.command("redo").value("ok").toBool());
+        fixture.backend.setViewMode("preview");
+        QTRY_VERIFY(preview->property("activeFocus").toBool());
+        QTest::keyClick(fixture.window.get(), Qt::Key_F, Qt::ControlModifier);
+        QTRY_COMPARE(fixture.backend.viewMode(), QStringLiteral("split"));
+        QTRY_VERIFY(fixture.find("searchField")->property("activeFocus").toBool());
+        QVERIFY(QMetaObject::invokeMethod(fixture.window.get(), "closeSearch"));
+        fixture.backend.setViewMode("preview");
+        QTRY_VERIFY(preview->property("activeFocus").toBool());
+        QTest::keyClick(fixture.window.get(), Qt::Key_H, Qt::ControlModifier);
+        QTRY_COMPARE(fixture.backend.viewMode(), QStringLiteral("split"));
+        QVERIFY(fixture.window->property("replaceOpen").toBool());
+    }
+    void rendersLiveMarkdownAndRelativeImages() {
+        UiFixture fixture;
+        QVERIFY2(fixture.load(m_qmlWarnings), qPrintable(fixture.error));
+        QVERIFY(QTest::qWaitForWindowExposed(fixture.window.get()));
+        const QString directory = m_profile->filePath("images");
+        QVERIFY(QDir().mkpath(directory));
+        QImage image(1600, 24, QImage::Format_ARGB32); image.fill(Qt::red);
+        QVERIFY(image.save(directory + "/example.png"));
+        const QString sample = "# Heading\n\n**bold** and *italic*\n\n- item\n- [x] done\n\n"
+                               "```cpp\nint value = 1;\n```\n\n| A | B |\n| --- | --- |\n| 1 | 2 |\n\n![Image](example.png)\n";
+        QVERIFY(writeFile(directory + "/document.md", sample.toUtf8()));
+        QVERIFY(fixture.command("open", {{"path", directory + "/document.md"}}).value("ok").toBool());
+        fixture.backend.setViewMode("split");
+        auto *preview = fixture.find("renderedPreview"); QVERIFY(preview);
+        auto *quickDocument = preview->property("textDocument").value<QQuickTextDocument *>();
+        QVERIFY(quickDocument);
+        auto *document = quickDocument->textDocument();
+        QTRY_VERIFY(document->toPlainText().contains("Heading"));
+        QVERIFY(!document->toPlainText().contains("**bold**"));
+        QCOMPARE(document->begin().blockFormat().headingLevel(), 1);
+        QTextCursor bold = document->find("bold");
+        QVERIFY(bold.charFormat().fontWeight() >= QFont::Bold);
+        QVERIFY(document->find("italic").charFormat().fontItalic());
+        QVERIFY(document->find("item").block().textList());
+        QVERIFY(document->toPlainText().contains("int value = 1;"));
+        bool hasTable = false;
+        for (auto *frame : document->rootFrame()->childFrames())
+            hasTable |= qobject_cast<QTextTable *>(frame) != nullptr;
+        QVERIFY(hasTable);
+        QCOMPARE(preview->property("baseUrl").toUrl(), QUrl::fromLocalFile(directory + "/"));
+        const auto resource = document->resource(QTextDocument::ImageResource, QUrl("example.png"));
+        QVERIFY(!resource.value<QImage>().isNull() || !resource.value<QPixmap>().isNull());
+        auto *previewViewport = fixture.find("previewViewport");
+        QTRY_VERIFY(previewViewport->property("contentWidth").toReal()
+                    > previewViewport->property("width").toReal());
+        QVERIFY(QMetaObject::invokeMethod(preview, "select", Q_ARG(int, 0), Q_ARG(int, 7)));
+        QVERIFY(QMetaObject::invokeMethod(preview, "copy"));
+        QCOMPARE(QApplication::clipboard()->text(), QStringLiteral("Heading"));
+        const auto before = fixture.state();
+        QVERIFY(fixture.replace(2, 9, "Updated").value("ok").toBool());
+        QTRY_VERIFY(document->toPlainText().startsWith("Updated"));
+        QVERIFY(fixture.command("undo").value("ok").toBool());
+        QTRY_VERIFY(document->toPlainText().startsWith("Heading"));
+        QVERIFY(fixture.command("redo").value("ok").toBool());
+        QTRY_VERIFY(document->toPlainText().startsWith("Updated"));
+        const QString moved = m_profile->filePath("moved");
+        QVERIFY(QDir().mkpath(moved));
+        image.fill(Qt::green);
+        QVERIFY(image.save(moved + "/example.png"));
+        QVERIFY(fixture.command("save_as", {{"path", moved + "/document.md"}}).value("ok").toBool());
+        QTRY_COMPARE(preview->property("baseUrl").toUrl(), QUrl::fromLocalFile(moved + "/"));
+        const auto movedResource = document->resource(QTextDocument::ImageResource, QUrl("example.png"));
+        const QImage movedImage = movedResource.canConvert<QImage>()
+            ? movedResource.value<QImage>() : movedResource.value<QPixmap>().toImage();
+        QVERIFY(!movedImage.isNull());
+        QCOMPARE(movedImage.pixelColor(0, 0), QColor(Qt::green));
+        QVERIFY(writeFile(moved + "/document.md", "# Reloaded\n"));
+        QVERIFY(fixture.command("reload").value("ok").toBool());
+        QTRY_COMPARE(document->toPlainText().trimmed(), QStringLiteral("Reloaded"));
+        QVERIFY(!before.value("modified").toBool());
+    }
+    void spacesPreviewBlocksWithoutExpandingLines() {
+        UiFixture fixture;
+        QVERIFY2(fixture.load(m_qmlWarnings), qPrintable(fixture.error));
+        QVERIFY(QTest::qWaitForWindowExposed(fixture.window.get()));
+        const QString sample = "# Title\n\nFirst paragraph line one  \nline two.\n\n"
+            "Second paragraph.\n\n## Section\n\n- First item\n- Second item\n\n"
+            "```cpp\nfirst_code_line();\nsecond_code_line();\n```\n\nAfter code.\n\n"
+            "> First quote paragraph.\n>\n> Second quote paragraph.\n\n"
+            "| Header | Other |\n| --- | --- |\n| Cell | Value |\n\nAfter table.\n";
+        QVERIFY(fixture.replace(0, 0, sample).value("ok").toBool());
+        const auto sourceState = fixture.state();
+        fixture.backend.setViewMode("preview");
+        auto *preview = fixture.find("renderedPreview");
+        auto *quickDocument = preview->property("textDocument").value<QQuickTextDocument *>();
+        QVERIFY(quickDocument);
+        QTextDocument *document = quickDocument->textDocument();
+        auto findBlock = [&](const QString &text) { return document->find(text).block(); };
+        QTRY_VERIFY(findBlock("Second paragraph.").isValid());
+        QTextBlock first = findBlock("First paragraph");
+        QTextBlock second = findBlock("Second paragraph");
+        QTextBlock heading = findBlock("Section");
+        QTextBlock item1 = findBlock("First item");
+        QTextBlock item2 = findBlock("Second item");
+        QTextBlock code1 = findBlock("first_code_line");
+        QTextBlock code2 = findBlock("second_code_line");
+        const qreal gap = second.blockFormat().bottomMargin();
+        QTRY_VERIFY(second.blockFormat().bottomMargin() > 0);
+        const QTextBlock hardBreakLine = findBlock("line two.");
+        if (hardBreakLine != first) {
+            QCOMPARE(first.blockFormat().bottomMargin(), 0.0);
+            QCOMPARE(hardBreakLine.blockFormat().topMargin(), 0.0);
+        }
+        QVERIFY(document->begin().blockFormat().topMargin() == 0);
+        QVERIFY(heading.blockFormat().topMargin() > gap);
+        QVERIFY(heading.blockFormat().bottomMargin() > 0);
+        QCOMPARE(first.blockFormat().lineHeightType(), int(QTextBlockFormat::SingleHeight));
+        QVERIFY(item2.blockFormat().topMargin() < gap);
+        QCOMPARE(item1.blockFormat().bottomMargin(), 0.0);
+        QVERIFY(item2.blockFormat().bottomMargin() > 0);
+        QCOMPARE(code1.blockFormat().bottomMargin(), 0.0);
+        QCOMPARE(code2.blockFormat().topMargin(), 0.0);
+        QVERIFY(code2.blockFormat().bottomMargin() > 0);
+        auto *layout = document->documentLayout();
+        QTRY_VERIFY(layout->blockBoundingRect(second).width() > 100);
+        const auto firstRect = layout->blockBoundingRect(hardBreakLine);
+        const auto secondRect = layout->blockBoundingRect(second);
+        QVERIFY(secondRect.top() - firstRect.bottom() >= gap - 1);
+        const auto code1Rect = layout->blockBoundingRect(code1);
+        const auto code2Rect = layout->blockBoundingRect(code2);
+        QVERIFY(code2Rect.top() - code1Rect.bottom() < gap / 2);
+        const QTextBlock cell = findBlock("Cell");
+        QCOMPARE(cell.blockFormat().topMargin(), 0.0);
+        QCOMPARE(cell.blockFormat().bottomMargin(), 0.0);
+        QVERIFY(QTextCursor(cell).currentTable()->format().bottomMargin() > 0);
+        const auto headerRect = layout->blockBoundingRect(findBlock("Header"));
+        const auto quoteRect = layout->blockBoundingRect(findBlock("Second quote"));
+        QVERIFY(headerRect.top() - quoteRect.bottom() >= gap - 1);
+        const auto afterTableRect = layout->blockBoundingRect(findBlock("After table"));
+        const auto cellRect = layout->blockBoundingRect(cell);
+        QVERIFY(afterTableRect.top() - cellRect.bottom() >= gap - 1);
+        QVERIFY(afterTableRect.top() - cellRect.bottom() < gap * 2);
+        QVERIFY(findBlock("First quote").blockFormat().bottomMargin() > 0);
+        QCOMPARE(fixture.state().value("text"), sourceState.value("text"));
+        QCOMPARE(fixture.state().value("version"), sourceState.value("version"));
+        QCOMPARE(fixture.state().value("canUndo"), sourceState.value("canUndo"));
+        fixture.backend.setTextScale(4.0 / 3.0);
+        QTRY_VERIFY(findBlock("Second paragraph").blockFormat().bottomMargin() > gap);
+        QCOMPARE(fixture.state().value("version"), sourceState.value("version"));
+        QVERIFY(fixture.replace(2, 7, "Updated title").value("ok").toBool());
+        QTRY_VERIFY(document->toPlainText().startsWith("Updated title"));
+        QTRY_VERIFY(findBlock("Second paragraph").blockFormat().bottomMargin() > 0);
+        fixture.backend.setTextScale(1);
+        capture(fixture, "spacing-preview");
+    }
+    void synchronizesScrollingAndResizesSplit() {
+        UiFixture fixture;
+        QVERIFY2(fixture.load(m_qmlWarnings), qPrintable(fixture.error));
+        QVERIFY(QTest::qWaitForWindowExposed(fixture.window.get()));
+        QString sample;
+        for (int i = 0; i < 100; ++i)
+            sample += QString("## Section %1\n\nA paragraph with **bold** text and several words.\n\n").arg(i);
+        QVERIFY(fixture.replace(0, 0, sample).value("ok").toBool());
+        fixture.backend.setViewMode("split");
+        auto *sourcePane = qobject_cast<QQuickItem *>(fixture.find("sourcePane"));
+        auto *previewPane = qobject_cast<QQuickItem *>(fixture.find("previewPane"));
+        QVERIFY(sourcePane); QVERIFY(previewPane);
+        QTRY_VERIFY(qAbs(sourcePane->width() - previewPane->width()) < 2);
+        auto *source = fixture.find("sourceViewport");
+        auto *preview = fixture.find("previewViewport");
+        auto extent = [](QObject *view) {
+            return view->property("contentHeight").toReal() - view->property("height").toReal();
+        };
+        QTRY_VERIFY(extent(source) > 0 && extent(preview) > 0);
+        QTRY_VERIFY(!fixture.window->property("synchronizingScroll").toBool());
+        QCoreApplication::processEvents();
+        source->setProperty("contentY", extent(source) * 0.35);
+        QTRY_VERIFY(qAbs(preview->property("contentY").toReal()/extent(preview) - 0.35) < 0.01);
+        preview->setProperty("contentY", extent(preview) * 0.7);
+        QTRY_VERIFY(qAbs(source->property("contentY").toReal()/extent(source) - 0.7) < 0.01);
+        const QPoint handle = sourcePane->mapToScene(QPointF(sourcePane->width() + 3, 80)).toPoint();
+        QTest::mousePress(fixture.window.get(), Qt::LeftButton, Qt::NoModifier, handle);
+        QTest::mouseMove(fixture.window.get(), handle + QPoint(100, 0));
+        QTest::mouseRelease(fixture.window.get(), Qt::LeftButton, Qt::NoModifier, handle + QPoint(100, 0));
+        QTRY_VERIFY(fixture.backend.splitRatio() > 0.55);
+        QCOMPARE(fixture.state().value("splitRatio").toDouble(), fixture.backend.splitRatio());
+        fixture.window->resize(720, 520);
+        fixture.backend.setTextScale(4.0/3.0);
+        QTRY_VERIFY(sourcePane->width() > 0 && previewPane->width() > 0);
+        auto *editor = qobject_cast<QQuickItem *>(fixture.find("sourceEditor"));
+        auto *rendered = qobject_cast<QQuickItem *>(fixture.find("renderedPreview"));
+        QTRY_VERIFY(editor->width() <= sourcePane->width());
+        QTRY_VERIFY(rendered->width() <= previewPane->width());
+        QTRY_VERIFY(qAbs(source->property("contentY").toReal()/extent(source)
+                           - preview->property("contentY").toReal()/extent(preview)) < 0.01);
+        QTRY_VERIFY(qAbs(preview->property("contentY").toReal()/extent(preview) - 0.7) < 0.01);
+        QVERIFY(QMetaObject::invokeMethod(editor, "forceActiveFocus"));
+        QTest::keyClick(fixture.window.get(), Qt::Key_X);
+        QTRY_COMPARE(fixture.state().value("text").toString().size(), sample.size() + 1);
+        auto caretVisible = [&] {
+            const QRectF caret = editor->property("cursorRectangle").toRectF();
+            const qreal bottom = editor->y() + caret.bottom();
+            const qreal top = source->property("contentY").toReal();
+            return bottom <= top + source->property("height").toReal()
+                && editor->y() + caret.top() >= top;
+        };
+        QTRY_VERIFY(caretVisible());
+        QVERIFY(fixture.replace(0, sample.size() + 1, "short").value("ok").toBool());
+        QTRY_COMPARE(source->property("contentY").toReal(), 0.0);
+        QTRY_COMPARE(preview->property("contentY").toReal(), 0.0);
+    }
     void findsInlineMarkdownRanges() {
         const auto markup = MarkdownHighlighter::inlineMarkup(
             QStringLiteral("**bold** and *italic* and [site](https://example.com)"));
@@ -304,8 +614,8 @@ private slots:
         UiFixture fixture;
         QVERIFY2(fixture.load(m_qmlWarnings), qPrintable(fixture.error));
         QVERIFY(fixture.find("sourceEditor"));
-        QVERIFY(!fixture.find("renderedPreview"));
-        QVERIFY(!fixture.find("modeToggle"));
+        QVERIFY(fixture.find("renderedPreview"));
+        QVERIFY(fixture.find("modeToggle"));
         QObject *save = fixture.find("saveButton");
         QObject *open = fixture.find("openButton");
         QVERIFY(save); QVERIFY(open);
@@ -700,12 +1010,28 @@ private slots:
             "- One reliable document\n- A reversible edit\n\nSearch this draft. Another draft follows.\n");
         QVERIFY(fixture.replace(0, 0, sample).value("ok").toBool());
         fixture.window->resize(1280, 820);
+        auto captureViews = [&](const QString &name) {
+            fixture.backend.setViewMode("split");
+            auto *source = fixture.find("sourceViewport");
+            auto *preview = fixture.find("previewViewport");
+            auto progress = [](QObject *view) {
+                const qreal extent = view->property("contentHeight").toReal() - view->property("height").toReal();
+                return extent > 0 ? view->property("contentY").toReal() / extent : 0;
+            };
+            QTRY_VERIFY(qAbs(progress(source) - progress(preview)) < 0.01);
+            capture(fixture, name + "-split");
+            fixture.backend.setViewMode("preview");
+            capture(fixture, name + "-preview");
+            fixture.backend.setViewMode("source");
+        };
         capture(fixture, QStringLiteral("dark"));
+        captureViews("dark");
         QVERIFY(writeFile(RuntimeProfile::themeDirectory() + QStringLiteral("/colors.toml"),
             "mode = \"light\"\nbackground = \"#ffffff\"\nforeground = \"#222324\"\n"
             "accent = \"#2077b2\"\nselection = \"#2077b2\"\n"));
         QTRY_VERIFY(!fixture.backend.darkMode());
         capture(fixture, QStringLiteral("light"));
+        captureViews("light");
         QVERIFY(writeFile(RuntimeProfile::themeDirectory() + QStringLiteral("/colors.toml"),
             "mode = \"dark\"\nbackground = \"#101010\"\nforeground = \"#eeeeee\"\n"
             "accent = \"#5584aa\"\nselection = \"#186a9a\"\n"));
@@ -716,6 +1042,7 @@ private slots:
         auto *editor = qobject_cast<QQuickItem *>(fixture.find("sourceEditor")); QVERIFY(editor);
         QTRY_VERIFY(editor->width() <= fixture.window->width());
         capture(fixture, QStringLiteral("minimum-scale"));
+        captureViews("minimum-scale");
         fixture.backend.setTextScale(1);
         fixture.window->resize(1280, 820);
         QTest::keyClick(fixture.window.get(), Qt::Key_F, Qt::ControlModifier);

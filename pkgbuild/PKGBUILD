@@ -2,7 +2,7 @@
 # Local checkout package. See ../docs/packaging.md before publishing on AUR.
 
 pkgname=omascribe
-pkgver=0.7.0
+pkgver=1.0.0
 pkgrel=1
 pkgdesc='Omascribe Markdown editor for Omarchy, based on Omawrite'
 arch=('x86_64')

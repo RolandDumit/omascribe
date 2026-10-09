@@ -34,6 +34,8 @@ build lock, so concurrent harness checks do not race compilation or tests.
 - `artifacts/` holds PNGs paired with JSON state snapshots for dark and light
   windows, minimum size with 4/3 text scale, search, unsaved-change decisions and
   external conflicts.
+  Source, Split view and Preview are also captured in both palettes and at the
+  minimum window size with 4/3 text scale.
 - `profile/tests/` preserves each test's separate settings, document and recovery
   fixture. `runtime/` holds the harness's initial temporary environment; Qt
   profile communication uses its short private runtime directory.
@@ -86,6 +88,13 @@ and saves; disk conflicts before watcher delivery; recovery after forced exit;
 pre-crash disk baselines and conservative legacy recovery; independent windows;
 malformed requests and control transport failures. UI
 fixtures exercise the rendered application rather than a copied test-only view.
+View tests cover selector interaction, preservation of selection/version/undo,
+read-only preview and copy, live Markdown rendering and relative images,
+profile-specific view preferences, search from Preview, synchronized scrolling
+and dragging the split divider.
+Preview typography checks distinguish block gaps from internal hard breaks and
+code lines, keep list items compact, verify table-frame spacing, and check
+scaling and source-state preservation. A spacing fixture is also captured.
 
 Use signal/condition waits and rendering completion rather than fixed delays.
 Real-process fixtures must close or terminate child applications on every exit,
@@ -104,6 +113,8 @@ shipping a change affecting it, use fixture documents and a desktop for:
 - Fractional display scaling, moving between monitors and live desktop text-scale
   changes. The 4/3 automated fixture exercises text scale, not monitor compositor
   behavior.
+- Split-pane wheel/touchpad scrolling, preview selection/copy and external links
+  on the desktop, plus large local images and wide Markdown tables.
 
 Normal-mode desktop theme following is checked separately from deterministic
 profiles. Record any unperformed manual check in the handoff; do not describe
